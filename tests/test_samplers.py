@@ -27,6 +27,7 @@ from transfer_queue.sampler.seqlen_balanced_sampler import (
     get_seqlen_balanced_partitions,
 )
 from transfer_queue.sampler.sequential_sampler import SequentialSampler
+from transfer_queue.sampler.streaming_token_budget_sampler import StreamingTokenBudgetSampler
 
 
 class TestBaseSampler:
@@ -1128,6 +1129,527 @@ class TestKarmarkarKarp:
 
         sums = [sum(seqlens[i] for i in p) for p in partitions]
         assert sums[0] == sums[1] == 100
+
+
+class TestStreamingTokenBudgetSampler:
+    """Test cases for StreamingTokenBudgetSampler."""
+
+    class MockPartition:
+        """Minimal mock for DataPartitionStatus providing get_custom_meta."""
+
+        def __init__(self, custom_meta: dict[int, dict]):
+            self._custom_meta = custom_meta
+
+        def get_custom_meta(self, global_indices: list[int]) -> dict[int, dict]:
+            return {idx: self._custom_meta.get(idx, {}) for idx in global_indices}
+
+    @staticmethod
+    def _partition_with_uniform_lengths(indexes, length):
+        return TestStreamingTokenBudgetSampler.MockPartition({i: {"total_lengths": length} for i in indexes})
+
+    # ---- Initialization ----
+
+    def test_initialization_defaults(self):
+        sampler = StreamingTokenBudgetSampler()
+        assert isinstance(sampler, GRPOGroupNSampler)
+        assert sampler.n_samples_per_prompt == 1
+        assert sampler.balance_unit_multiplier == 1
+        assert sampler._buckets == {}
+        assert sampler._assigned_global == {}
+        assert sampler._resolved_lengths == {}
+
+    def test_initialization_invalid_balance_unit_multiplier(self):
+        with pytest.raises(ValueError) as exc_info:
+            StreamingTokenBudgetSampler(balance_unit_multiplier=0)
+        assert "balance_unit_multiplier must be positive" in str(exc_info.value)
+
+        with pytest.raises(ValueError):
+            StreamingTokenBudgetSampler(balance_unit_multiplier=-3)
+
+    def test_initialization_invalid_n_samples_per_prompt(self):
+        # Inherited validation from GRPOGroupNSampler.
+        with pytest.raises(ValueError) as exc_info:
+            StreamingTokenBudgetSampler(n_samples_per_prompt=0)
+        assert "must be positive" in str(exc_info.value)
+
+    # ---- Fallback path (no token_budget) ----
+
+    def test_fallback_to_grpo_without_token_budget(self):
+        """Without token_budget, delegate to the inherited GRPO sample()."""
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=2)
+        ready_indexes = [0, 1, 2, 3, 4, 5, 6, 7]
+
+        sampled, consumed = sampler.sample(ready_indexes, batch_size=4, task_name="ref", partition_id="p0")
+
+        assert sampled == [0, 1, 2, 3]
+        assert consumed == [0, 1, 2, 3]
+
+    def test_fallback_strips_streaming_only_kwargs(self):
+        """Streaming-only kwargs must not leak into the GRPO fallback call."""
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=2)
+        ready_indexes = [0, 1, 2, 3]
+
+        # dp_size / allow_underfill / partition are streaming extras; GRPO must
+        # not choke on them. (token_budget absent → fallback path.)
+        sampled, consumed = sampler.sample(
+            ready_indexes,
+            batch_size=2,
+            task_name="ref",
+            partition_id="p0",
+            dp_size=2,
+            allow_underfill=True,
+            partition=object(),
+        )
+
+        assert sampled == [0, 1]
+        assert consumed == [0, 1]
+
+    # ---- Argument validation (token_budget path) ----
+
+    def test_requires_dp_rank_and_dp_size(self):
+        sampler = StreamingTokenBudgetSampler()
+        with pytest.raises(ValueError) as exc_info:
+            sampler.sample([0, 1], batch_size=0, token_budget=100, partition=object())
+        assert "dp_rank" in str(exc_info.value)
+
+    def test_requires_partition(self):
+        sampler = StreamingTokenBudgetSampler()
+        with pytest.raises(ValueError) as exc_info:
+            sampler.sample(
+                [0, 1, 2, 3],
+                batch_size=0,
+                token_budget=100,
+                dp_rank=0,
+                dp_size=1,
+            )
+        assert "partition" in str(exc_info.value)
+
+    # ---- Basic token-budget slicing (single DP) ----
+
+    def test_single_dp_packs_without_overshooting_budget(self):
+        """Single DP packs the largest prefix that does NOT overshoot the budget.
+
+        With samples of length 100 and budget 250, the third sample would push the
+        slice to 300 > 250, so the slice stops at 2 samples (200). Including a
+        sample that overshoots the budget risks an oversized micro-batch (OOM).
+        """
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=1)
+        ready_indexes = [0, 1, 2, 3]
+        partition = self._partition_with_uniform_lengths(ready_indexes, 100)
+
+        sampled, consumed = sampler.sample(
+            ready_indexes,
+            batch_size=0,
+            task_name="actor",
+            partition_id="p0",
+            token_budget=250,
+            dp_rank=0,
+            dp_size=1,
+            batch_index=0,
+            partition=partition,
+        )
+
+        assert sampled == consumed
+        # 100 + 100 = 200 <= 250; adding a third (300) would overshoot.
+        assert sampled == [0, 1]
+
+    def test_single_dp_exact_budget(self):
+        """When a prefix sums exactly to the budget, it is returned in full."""
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=1)
+        ready_indexes = [0, 1, 2, 3]
+        partition = self._partition_with_uniform_lengths(ready_indexes, 100)
+
+        sampled, _ = sampler.sample(
+            ready_indexes,
+            batch_size=0,
+            task_name="actor",
+            partition_id="p0",
+            token_budget=200,  # exactly two samples
+            dp_rank=0,
+            dp_size=1,
+            batch_index=0,
+            partition=partition,
+        )
+
+        assert sampled == [0, 1]
+
+    def test_single_dp_oversized_sample_yields_at_least_one(self):
+        """A single sample exceeding the budget is still returned (progress)."""
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=1)
+        ready_indexes = [0, 1, 2, 3]
+        partition = self._partition_with_uniform_lengths(ready_indexes, 1000)
+
+        sampled, consumed = sampler.sample(
+            ready_indexes,
+            batch_size=0,
+            task_name="actor",
+            partition_id="p0",
+            token_budget=100,  # smaller than a single sample
+            dp_rank=0,
+            dp_size=1,
+            batch_index=0,
+            partition=partition,
+        )
+
+        assert len(sampled) == 1
+        assert sampled == consumed
+
+    # ---- Cross-DP balancing ----
+
+    def test_cross_dp_token_balance(self):
+        """Two DPs at the same batch_index get token-balanced, disjoint slices."""
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=1)
+        ready_indexes = [0, 1, 2, 3]
+        # Two long, two short → balanced split should pair long+short per DP.
+        partition = self.MockPartition(
+            {
+                0: {"total_lengths": 100},
+                1: {"total_lengths": 100},
+                2: {"total_lengths": 10},
+                3: {"total_lengths": 10},
+            }
+        )
+        common = dict(
+            task_name="actor",
+            partition_id="p0",
+            dp_size=2,
+            batch_index=0,
+            partition=partition,
+            token_budget=110,
+        )
+
+        sampled_0, consumed_0 = sampler.sample(ready_indexes, 0, dp_rank=0, **common)
+        sampled_1, consumed_1 = sampler.sample(ready_indexes, 0, dp_rank=1, **common)
+
+        # Disjoint and fully covering.
+        assert set(sampled_0).isdisjoint(sampled_1)
+        assert set(sampled_0 + sampled_1) == {0, 1, 2, 3}
+        assert sampled_0 == consumed_0
+        assert sampled_1 == consumed_1
+
+        lengths = {0: 100, 1: 100, 2: 10, 3: 10}
+        tok_0 = sum(lengths[i] for i in sampled_0)
+        tok_1 = sum(lengths[i] for i in sampled_1)
+        # Perfect balance: each DP gets one long + one short = 110.
+        assert tok_0 == tok_1 == 110
+
+    # ---- PP-stage cache (batch_index alignment) ----
+
+    def test_batch_index_cache_is_stable(self):
+        """Repeated requests for the same (dp_rank, batch_index) hit the cache."""
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=1)
+        ready_indexes = [0, 1, 2, 3]
+        partition = self._partition_with_uniform_lengths(ready_indexes, 50)
+        kwargs = dict(
+            task_name="actor",
+            partition_id="p0",
+            dp_rank=0,
+            dp_size=2,
+            batch_index=0,
+            partition=partition,
+            token_budget=50,
+        )
+
+        first, _ = sampler.sample(ready_indexes, 0, **kwargs)
+        # Second call with a DIFFERENT ready pool must still return the cached slice.
+        second, _ = sampler.sample([10, 11, 12, 13], 0, **kwargs)
+
+        assert first == second
+        assert first  # non-empty
+
+    def test_different_batch_index_advances_stream(self):
+        """Different batch_index consumes the next slice (no re-issue)."""
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=1)
+        ready_all = [0, 1, 2, 3, 4, 5, 6, 7]
+        partition = self._partition_with_uniform_lengths(ready_all, 100)
+        base = dict(
+            task_name="actor",
+            partition_id="p0",
+            dp_rank=0,
+            dp_size=1,
+            partition=partition,
+            token_budget=100,
+        )
+
+        b0, _ = sampler.sample(ready_all, 0, batch_index=0, **base)
+        # Remaining ready pool excludes what batch 0 took.
+        remaining = [i for i in ready_all if i not in b0]
+        b1, _ = sampler.sample(remaining, 0, batch_index=1, **base)
+
+        assert b0
+        assert b1
+        assert set(b0).isdisjoint(b1)
+
+    # ---- End-of-stream tail flush ----
+
+    def test_tail_flush_on_production_done_drains_all(self):
+        """production_done releases a sub-balance_unit remainder into the buckets.
+
+        A single batch_index returns one budget-sized micro-batch per DP, but the
+        tail flush guarantees EVERY ready sample is assigned to some DP bucket so
+        nothing is orphaned (which would livelock end-of-stream). We drain across
+        successive batch_index calls and assert full coverage with no overlap.
+        """
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=2, balance_unit_multiplier=4)
+        # balance_unit = dp_size(2) * n(2) * mult(4) = 16, but only 4 ready.
+        all_indexes = [0, 1, 2, 3]
+        partition = self._partition_with_uniform_lengths(all_indexes, 10)
+
+        # The controller removes consumed samples from the ready pool, so we model
+        # that by feeding only the not-yet-drained indexes on each new batch_index.
+        drained: list[int] = []
+        for batch_index in range(4):  # more than enough to fully drain
+            ready_now = [i for i in all_indexes if i not in drained]
+            for dp_rank in (0, 1):
+                sampled, consumed = sampler.sample(
+                    ready_now,
+                    0,
+                    task_name="actor",
+                    partition_id="p0",
+                    dp_rank=dp_rank,
+                    dp_size=2,
+                    batch_index=batch_index,
+                    partition=partition,
+                    token_budget=10,
+                    production_done=True,
+                )
+                assert sampled == consumed
+                drained.extend(sampled)
+
+        # Every produced sample drained exactly once across the stream.
+        assert sorted(drained) == [0, 1, 2, 3]
+        assert len(drained) == len(set(drained))
+
+    def test_tail_flush_assigns_all_to_buckets(self):
+        """First production_done call must assign all ready samples to buckets."""
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=2, balance_unit_multiplier=4)
+        ready_indexes = [0, 1, 2, 3]
+        partition = self._partition_with_uniform_lengths(ready_indexes, 10)
+
+        sampler.sample(
+            ready_indexes,
+            0,
+            task_name="actor",
+            partition_id="p0",
+            dp_rank=0,
+            dp_size=2,
+            batch_index=0,
+            partition=partition,
+            token_budget=10,
+            production_done=True,
+        )
+
+        assigned = sampler._assigned_global[("p0", "actor")]
+        bucketed = set()
+        for bucket in sampler._buckets[("p0", "actor")].values():
+            bucketed.update(bucket)
+        # Everything not yet popped is still tracked in assigned and lives in a bucket.
+        assert assigned == bucketed
+        # All four samples are accounted for (either popped this call or bucketed).
+        popped = set(range(4)) - assigned
+        assert (assigned | popped) == {0, 1, 2, 3}
+
+    def test_no_complete_group_without_production_done_returns_empty(self):
+        """No complete GRPO group + not end-of-stream → return empty (wait for more)."""
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=2, balance_unit_multiplier=4)
+        # Non-consecutive indexes → GRPOGroupNSampler finds no complete group of 2.
+        ready_indexes = [0, 2]
+        partition = self._partition_with_uniform_lengths(ready_indexes, 10)
+
+        sampled, consumed = sampler.sample(
+            ready_indexes,
+            0,
+            task_name="actor",
+            partition_id="p0",
+            dp_rank=0,
+            dp_size=2,
+            batch_index=0,
+            partition=partition,
+            token_budget=10,
+            production_done=False,
+        )
+
+        assert sampled == []
+        assert consumed == []
+
+    def test_complete_group_drains_below_balance_unit(self):
+        """A single complete group is released even below balance_unit (trickle drain).
+
+        With long responses the producer trickles one group at a time and the ready
+        pool stays below balance_unit; the sampler must still make progress rather
+        than wait for a full unit forever.
+        """
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=2, balance_unit_multiplier=4)
+        # balance_unit = 16, but a single consecutive group [0,1] is ready.
+        ready_indexes = [0, 1]
+        partition = self._partition_with_uniform_lengths(ready_indexes, 10)
+
+        got_any = False
+        for dp_rank in (0, 1):
+            sampled, _ = sampler.sample(
+                ready_indexes,
+                0,
+                task_name="actor",
+                partition_id="p0",
+                dp_rank=dp_rank,
+                dp_size=2,
+                batch_index=0,
+                partition=partition,
+                token_budget=10,
+                production_done=False,
+            )
+            got_any = got_any or bool(sampled)
+
+        assert got_any, "a complete group below balance_unit should still be released"
+
+    # ---- Missing total_lengths fallback ----
+
+    def test_missing_total_lengths_uses_budget_fallback(self):
+        """Samples lacking total_lengths fall back to token_budget (safe over-estimate)."""
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=1)
+        ready_indexes = [0, 1, 2, 3]
+        # No custom_meta at all → every sample missing total_lengths.
+        partition = self.MockPartition({})
+
+        sampled, consumed = sampler.sample(
+            ready_indexes,
+            0,
+            task_name="actor",
+            partition_id="p0",
+            dp_rank=0,
+            dp_size=1,
+            batch_index=0,
+            partition=partition,
+            token_budget=500,
+        )
+
+        # With fallback length == budget, one sample already meets the budget.
+        assert len(sampled) == 1
+        assert sampled == consumed
+
+    # ---- Assignment / no double-issue ----
+
+    def test_bucketed_samples_not_reassigned(self):
+        """Samples already sitting in a bucket are filtered out of the ready pool.
+
+        The sampler tracks bucketed-but-not-yet-popped samples in ``assigned`` and
+        excludes them from ``available_ready`` so a balance round never re-assigns a
+        sample that is already waiting in some DP's bucket. (Consumed samples are
+        filtered by the controller, not the sampler.)
+        """
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=1)
+        # dp_size=2, budget small → each balance round assigns 2 samples (one per
+        # DP) but each DP pops only its budget slice, leaving the rest bucketed.
+        ready_all = [0, 1, 2, 3]
+        partition = self._partition_with_uniform_lengths(ready_all, 100)
+
+        # First call (batch 0) seeds buckets for both DPs.
+        sampler.sample(
+            ready_all,
+            0,
+            task_name="actor",
+            partition_id="p0",
+            dp_rank=0,
+            dp_size=2,
+            batch_index=0,
+            partition=partition,
+            token_budget=100,
+        )
+        sampler.sample(
+            ready_all,
+            0,
+            task_name="actor",
+            partition_id="p0",
+            dp_rank=1,
+            batch_index=0,
+            dp_size=2,
+            partition=partition,
+            token_budget=100,
+        )
+
+        assigned = sampler._assigned_global[("p0", "actor")]
+        bucketed = set()
+        for bucket in sampler._buckets[("p0", "actor")].values():
+            bucketed.update(bucket)
+        # Invariant: assigned set == union of bucket contents (no leak, no double-count).
+        assert assigned == bucketed
+        # No index appears in more than one DP bucket.
+        all_bucket_items = [i for b in sampler._buckets[("p0", "actor")].values() for i in b]
+        assert len(all_bucket_items) == len(set(all_bucket_items))
+
+    # ---- clear_cache ----
+
+    def test_clear_cache_removes_partition_state(self):
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=1)
+        ready_indexes = [0, 1, 2, 3]
+        partition = self._partition_with_uniform_lengths(ready_indexes, 50)
+
+        sampler.sample(
+            ready_indexes,
+            0,
+            task_name="actor",
+            partition_id="p0",
+            dp_rank=0,
+            dp_size=1,
+            batch_index=0,
+            partition=partition,
+            token_budget=50,
+        )
+
+        # State should now exist for p0.
+        assert any(k[0] == "p0" for k in sampler._buckets)
+        assert "p0" in sampler._states
+
+        sampler.clear_cache("p0")
+
+        assert all(k[0] != "p0" for k in sampler._buckets)
+        assert all(k[0] != "p0" for k in sampler._assigned_global)
+        assert all(k[0] != "p0" for k in sampler._resolved_lengths)
+        assert "p0" not in sampler._states
+        # Internal GRPO scratch state used by balance rounds must be cleared too.
+        assert "__streaming_internal__" not in sampler._states
+
+    def test_clear_cache_only_affects_target_partition(self):
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=1)
+        for pid in ("p0", "p1"):
+            partition = self._partition_with_uniform_lengths([0, 1, 2, 3], 50)
+            sampler.sample(
+                [0, 1, 2, 3],
+                0,
+                task_name="actor",
+                partition_id=pid,
+                dp_rank=0,
+                dp_size=1,
+                batch_index=0,
+                partition=partition,
+                token_budget=50,
+            )
+
+        sampler.clear_cache("p0")
+
+        assert all(k[0] != "p0" for k in sampler._buckets)
+        assert any(k[0] == "p1" for k in sampler._buckets)
+
+    # ---- Empty input ----
+
+    def test_empty_ready_indexes_returns_empty(self):
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=1)
+        partition = self.MockPartition({})
+
+        sampled, consumed = sampler.sample(
+            [],
+            0,
+            task_name="actor",
+            partition_id="p0",
+            dp_rank=0,
+            dp_size=1,
+            batch_index=0,
+            partition=partition,
+            token_budget=100,
+        )
+
+        assert sampled == []
+        assert consumed == []
 
 
 class TestSamplerIntegration:

@@ -96,12 +96,13 @@ class AsyncTransferQueueClient:
     async def async_get_meta(
         self,
         data_fields: list[str],
-        batch_size: int,
-        partition_id: str,
+        batch_size: Optional[int] = None,
+        partition_id: str = "",
         mode: str = "fetch",
-        task_name: str | None = None,
-        sampling_config: dict[str, Any] | None = None,
-        socket: zmq.asyncio.Socket | None = None,
+        task_name: Optional[str] = None,
+        sampling_config: Optional[dict[str, Any]] = None,
+        token_budget: Optional[int] = None,
+        socket: Optional[zmq.asyncio.Socket] = None,
     ) -> BatchMeta:
         """Asynchronously fetch data metadata from the controller via ZMQ.
 
@@ -164,6 +165,7 @@ class AsyncTransferQueueClient:
                 "mode": mode,
                 "task_name": task_name,
                 "sampling_config": sampling_config,
+                "token_budget": token_budget,
             },
         )
 
@@ -262,6 +264,7 @@ class AsyncTransferQueueClient:
         metadata: BatchMeta | None = None,
         partition_id: str | None = None,
         data_parser: Callable[[Any], Any] | None = None,
+        custom_meta: Optional[list[dict[str, Any]]] = None,
     ) -> BatchMeta:
         """Asynchronously write data to storage units based on metadata.
 
@@ -270,6 +273,13 @@ class AsyncTransferQueueClient:
 
         During put, the custom_meta in metadata will update the corresponding custom_meta in
         TransferQueue Controller.
+
+        If ``custom_meta`` is provided (a per-sample list aligned with ``data`` rows),
+        it is attached to the metadata BEFORE the data is written, so it rides the same
+        readiness notification and lands atomically with the samples becoming consumable.
+        This avoids a separate ``async_set_custom_meta`` round-trip and the associated
+        race where a streaming consumer fetches a ready sample before its custom_meta
+        has been set.
 
         Note:
             When using multiple workers for distributed execution, there may be data
@@ -356,12 +366,20 @@ class AsyncTransferQueueClient:
         if not metadata or metadata.size == 0:
             raise ValueError("metadata cannot be none or empty")
 
+        # Attach inline custom_meta before the write so it rides put_data's readiness
+        # notification and lands atomically with the samples becoming consumable.
+        if custom_meta is not None:
+            metadata.update_custom_meta(custom_meta)
+
         with limit_pytorch_auto_parallel_threads(
             target_num_threads=TQ_NUM_THREADS, info=f"[{self.client_id}] async_put"
         ):
             await self.storage_manager.put_data(data, metadata, data_parser=data_parser)
 
-        await self.async_set_custom_meta(metadata)
+        # Inline custom_meta is already delivered atomically via put_data → notify;
+        # only fall back to the separate RPC when it was set out-of-band on metadata.
+        if custom_meta is None:
+            await self.async_set_custom_meta(metadata)
 
         logger.debug(
             f"[{self.client_id}]: partition {partition_id} put {metadata.size} samples to storage units successfully."
@@ -1265,11 +1283,12 @@ class TransferQueueClient(AsyncTransferQueueClient):
     def get_meta(
         self,
         data_fields: list[str],
-        batch_size: int,
-        partition_id: str,
+        batch_size: Optional[int] = None,
+        partition_id: str = "",
         mode: str = "fetch",
-        task_name: str | None = None,
-        sampling_config: dict[str, Any] | None = None,
+        task_name: Optional[str] = None,
+        sampling_config: Optional[dict[str, Any]] = None,
+        token_budget: Optional[int] = None,
     ) -> BatchMeta:
         """Synchronously fetch data metadata from the controller via ZMQ.
 
@@ -1328,6 +1347,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
             mode=mode,
             task_name=task_name,
             sampling_config=sampling_config,
+            token_budget=token_budget,
         )
 
     def set_custom_meta(self, metadata: BatchMeta) -> None:
