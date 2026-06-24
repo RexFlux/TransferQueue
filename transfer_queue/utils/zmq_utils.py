@@ -76,6 +76,17 @@ class ZMQRequestType(ExplicitEnum):
     RESET_CONSUMPTION = "RESET_CONSUMPTION"
     RESET_CONSUMPTION_RESPONSE = "RESET_CONSUMPTION_RESPONSE"
 
+    # CHECK_STREAM_DRAINED (streaming end-of-stream: production_completed AND
+    # all actually-inserted samples consumed by the task)
+    CHECK_STREAM_DRAINED = "CHECK_STREAM_DRAINED"
+    CHECK_STREAM_DRAINED_RESPONSE = "CHECK_STREAM_DRAINED_RESPONSE"
+
+    # CHECK_PRODUCTION_COMPLETED (producer-side only: the partition's producer has
+    # declared the final batch via is_last AND its data is ready — independent of
+    # any consumption. Used as the weight-update / training-admission gate.)
+    CHECK_PRODUCTION_COMPLETED = "CHECK_PRODUCTION_COMPLETED"
+    CHECK_PRODUCTION_COMPLETED_RESPONSE = "CHECK_PRODUCTION_COMPLETED_RESPONSE"
+
     # GET_PRODUCTION
     GET_PRODUCTION = "GET_PRODUCTION"
     PRODUCTION_RESPONSE = "PRODUCTION_RESPONSE"

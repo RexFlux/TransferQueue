@@ -154,6 +154,8 @@ class StreamingTokenBudgetSampler(GRPOGroupNSampler):
         # PP-stage cache: when multiple PP stages request the same
         # (partition_id, task_name, dp_rank, batch_index), return the
         # cached result from the first call so all stages see identical data.
+        # At EOS, a DP cache miss may still need one more prepare to drain
+        # residue left by another DP rank's earlier prepare.
         if batch_index is not None:
             cached = self._states.get(partition_id, {}).get(task_name, {}).get(dp_rank, {}).get(batch_index, None)
             if cached is not None:
@@ -165,6 +167,9 @@ class StreamingTokenBudgetSampler(GRPOGroupNSampler):
                     batch_index,
                 )
                 return cached
+            if production_done:
+                # Drop the batch-wide guard so prepare can fill this DP slot.
+                self._states.get(partition_id, {}).get(task_name, {}).get(0, {}).pop(batch_index, None)
 
         if partition is None:
             raise ValueError("StreamingTokenBudgetSampler requires partition kwarg from the controller")
@@ -307,14 +312,18 @@ class StreamingTokenBudgetSampler(GRPOGroupNSampler):
             self._flush_tail(available_ready, dp_size, partition, buckets, assigned, resolved_lengths)
             available_ready = [i for i in available_ready if i not in assigned]
 
-        # ── Phase 3: slice one mb per dp and commit independently ────────
-        # Each dp pops up to a token-budget slice from its own bucket and
-        # caches it independently.  We do NOT require all dps to be non-empty
-        # (no all-or-nothing rollback — that livelocked at the tail): cross-dp
-        # mb-count differences are handled by the iterator's dummy-pad barrier.
+        # ── Phase 3: slice one budget-sized mb per dp ────────────────────────
+        # Pop only a token-budget slice (never the whole bucket — that builds an
+        # oversized mb and OOMs on long sequences); residue drains over successive
+        # batch_index rounds as the consumer advances each dp on non-empty fetches.
+        # At EOS, cache an explicit empty result for an already-empty dp so the
+        # dp=0 ``already`` guard stays set and batch_index isn't recomputed/frozen
+        # (which would strand other dps' residue).
         for dp_i in range(dp_size):
             bucket = buckets.setdefault(dp_i, [])
             if not bucket:
+                if is_eos:
+                    self._cache_result(partition_id, task_name, dp_i, batch_index, ([], []))
                 continue
             sel_count = self._select_up_to_budget(bucket, resolved_lengths, token_budget)
             sel_count = max(sel_count, 1)  # always make progress

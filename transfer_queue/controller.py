@@ -364,6 +364,20 @@ class DataPartitionStatus:
     keys_mapping: dict[str, int] = field(default_factory=dict)  # key -> global_idx
     revert_keys_mapping: dict[int, str] = field(default_factory=dict)  # global_idx -> key
 
+    # ── Streaming end-of-stream tracking (no preset global batch) ──────────────
+    # The producer marks the final batch via is_last; drain ends when every
+    # actually-inserted sample is consumed, instead of relying on the partition
+    # being pre-allocated to global_batch_size and a tensor-wide .all().
+    production_completed: bool = False  # set once the is_last batch's data is ready
+    actual_sample_count: int = 0  # samples actually inserted (sum of insert batch_sizes)
+    pending_last_indexes: set[int] = field(default_factory=set)  # is_last batch indexes
+    has_pending_last: bool = False  # is_last announced, completion not yet flipped
+    pending_last_fields: set[str] = field(default_factory=set)  # producer fields from is_last batch
+
+    # Threading lock for concurrency control; only for preventing mask operation error when expanding production_status.
+    # No need to strictly lock for every read/write operation since freshness is not critical.
+    data_status_lock: Lock = field(default_factory=Lock)
+
     # Dynamic configuration - these are computed from the current state
     @property
     def total_samples_num(self) -> int:
@@ -560,11 +574,50 @@ class DataPartitionStatus:
             # Save these global_indexes
             self.global_indexes.update(global_indices)
 
+            # Streaming end-of-stream: the producer announced the final batch at
+            # insert time (pending_last_indexes); flip production_completed only now
+            # that those samples are actually marked ready, so consumers never see
+            # "completed" before the last batch's data has landed.
+            self._maybe_mark_production_completed()
+
             return True
 
         except Exception as e:
             logger.error(f"Error updating production status for partition {self.partition_id}: {e}")
             return False
+
+    def _maybe_mark_production_completed(self) -> None:
+        """Flip ``production_completed`` once every sample of the is_last batch
+        (``pending_last_indexes``) is produced for the producer's own fields.
+
+        No-op until the producer marked a final batch (``has_pending_last``).
+        Only the producer's declared fields (``pending_last_fields``) are required
+        — not downstream-backfilled columns (advantages, ref_log_probs) that the
+        producer never writes. Locked: reached from the NOTIFY_DATA_UPDATE thread
+        and the GET_META insert path concurrently.
+        """
+        with self.data_status_lock:
+            if self.production_completed or not self.has_pending_last:
+                return
+            if not self.pending_last_indexes:
+                return
+            if self.production_status is None or self.total_fields_num == 0:
+                return
+            idx = sorted(self.pending_last_indexes)
+            # is_last indexes may exceed the tensor if an earlier batch's notify
+            # arrives before the final batch's data grows it → not ready yet.
+            if idx[-1] >= self.allocated_samples_num:
+                return
+            col_indices = [self.field_name_mapping[f] for f in self.pending_last_fields if f in self.field_name_mapping]
+            if not col_indices:
+                return
+            rows = self.production_status[torch.tensor(idx)][:, torch.tensor(sorted(col_indices))]
+            if bool((rows == 1).all().item()):
+                self.production_completed = True
+                logger.debug(
+                    f"Partition {self.partition_id}: production_completed "
+                    f"(actual_sample_count={self.actual_sample_count})"
+                )
 
     def _update_field_metadata(
         self,
@@ -608,8 +661,18 @@ class DataPartitionStatus:
         try:
             _, consumption_status = self.get_consumption_status(task_name, mask=False)
 
-            if consumption_status.numel() > 0 and global_indices:
-                consumption_status[global_indices] = 1
+            if global_indices:
+                # mask=False does not expand the tensor; grow it here so a write to
+                # a high index never silently drops a consumed mark (→ drain deadlock).
+                required_len = max(global_indices) + 1
+                if consumption_status.shape[0] < required_len:
+                    with self.data_status_lock:
+                        grown = torch.zeros(required_len, dtype=consumption_status.dtype)
+                        grown[: consumption_status.shape[0]] = consumption_status
+                        self.consumption_status[task_name] = grown
+                        consumption_status = grown
+                if consumption_status.numel() > 0:
+                    consumption_status[global_indices] = 1
         except Exception as e:
             logger.error(
                 f"Error marking samples consumed for partition {self.partition_id}, task {task_name}: {e}. "
@@ -618,6 +681,71 @@ class DataPartitionStatus:
             )
 
     # ==================== Consumption Status Interface ====================
+    def is_stream_drained(self, task_name: str) -> bool:
+        """Streaming end-of-stream test: producer done (``production_completed``)
+        AND every actually-inserted sample consumed by ``task_name``.
+
+        Counts consumed samples over the activated ``global_indexes`` (not a
+        tensor-wide ``.all()``), so unactivated pre-allocated rows never block
+        drain and index allocation need not be contiguous.
+        """
+        if not self.production_completed:
+            return False
+        if self.actual_sample_count <= 0:
+            return False
+        if task_name not in self.consumption_status:
+            return False
+        active = sorted(self.global_indexes)
+        if len(active) < self.actual_sample_count:
+            return False
+        cons = self.consumption_status[task_name]
+        if cons.numel() == 0:
+            return False
+        # The per-task consumption tensor grows lazily and may be shorter than
+        # max(active)+1; pad a read-only copy (zeros = unconsumed) so indexing is
+        # safe without mutating stored state (mark_consumed grows it on writes).
+        required_len = active[-1] + 1
+        if cons.shape[0] < required_len:
+            padded = torch.zeros(required_len, dtype=cons.dtype)
+            padded[: cons.shape[0]] = cons
+            cons = padded
+        idx = torch.tensor(active, dtype=torch.long)
+        consumed = int((cons[idx] == 1).sum().item())
+        return consumed >= self.actual_sample_count
+
+    def are_unconsumed_fields_ready(self, task_name: str, field_names: list[str]) -> bool:
+        """Return True once producer EOS and requested fields are ready."""
+        if not self.production_completed:
+            return False
+        active = sorted(self.global_indexes)
+        if len(active) < self.actual_sample_count:
+            return False
+        if not field_names:
+            return True
+        if any(field_name not in self.field_name_mapping for field_name in field_names):
+            return False
+
+        cons = self.consumption_status.get(task_name)
+        if cons is None or cons.numel() == 0:
+            unconsumed = active
+        else:
+            required_len = active[-1] + 1 if active else 0
+            if cons.shape[0] < required_len:
+                padded = torch.zeros(required_len, dtype=cons.dtype)
+                padded[: cons.shape[0]] = cons
+                cons = padded
+            active_consumed = (cons[torch.tensor(active, dtype=torch.long)] == 1).tolist()
+            unconsumed = [idx for idx, consumed in zip(active, active_consumed, strict=False) if not consumed]
+
+        if not unconsumed:
+            return True
+        if unconsumed[-1] >= self.allocated_samples_num:
+            return False
+
+        col_indices = [self.field_name_mapping[field_name] for field_name in field_names]
+        rows = self.production_status[torch.tensor(unconsumed, dtype=torch.long)][:, torch.tensor(col_indices)]
+        return bool((rows == 1).all().item())
+
     def get_consumption_status(self, task_name: str, mask: bool = False) -> tuple[Tensor, Tensor]:
         """
         Get or create consumption status for a specific task.
@@ -1163,7 +1291,37 @@ class TransferQueueController:
 
         return partition.get_consumption_status(task_name, mask=True)
 
-    def get_production_status(self, partition_id: str, data_fields: list[str]) -> tuple[Tensor | None, Tensor | None]:
+    def check_stream_drained(self, partition_id: str, task_name: str) -> bool:
+        """Streaming end-of-stream test for a (partition, task).
+
+        Returns True iff the producer announced completion (``production_completed``)
+        AND every actually-inserted sample of the partition has been consumed by
+        ``task_name``.  Used in place of ``check_consumption_status`` on the
+        no-preset-global-batch path, where a tensor-wide ``.all()`` would either
+        fire early (dynamic growth) or never (unactivated pre-allocated rows).
+        """
+        partition = self._get_partition(partition_id)
+        if not partition:
+            return False
+        return partition.is_stream_drained(task_name)
+
+    def check_production_completed(self, partition_id: str) -> bool:
+        """Producer-side completion test for a partition (no consumption involved).
+
+        Returns True iff the partition exists and its producer has declared the
+        final batch via ``is_last`` AND that batch's data is ready
+        (``production_completed``).  This is the no-preset-global-batch replacement
+        for the ``production_status.all()`` admission gate, which relied on the
+        partition being pre-allocated to exactly ``global_batch_size``.
+        """
+        partition = self._get_partition(partition_id)
+        if not partition:
+            return False
+        return bool(partition.production_completed)
+
+    def get_production_status(
+        self, partition_id: str, data_fields: list[str]
+    ) -> tuple[Optional[Tensor], Optional[Tensor]]:
         """
         Check if all samples for specified fields are fully produced in a partition.
 
@@ -1230,6 +1388,7 @@ class TransferQueueController:
         batch_size: int | None = None,
         sampling_config: Optional[dict[str, Any]] = None,
         token_budget: int | None = None,
+        is_last: bool = False,
         *args,
         **kwargs,
     ) -> BatchMeta:
@@ -1290,6 +1449,23 @@ class TransferQueueController:
             # register global_indexes in partition
             partition.global_indexes.update(batch_global_indexes)
 
+            # Streaming end-of-stream bookkeeping. Only insert puts reach here, so
+            # actual_sample_count counts each sample once (backfill puts carry
+            # metadata and skip this branch).
+            with partition.data_status_lock:
+                partition.actual_sample_count += batch_size
+                if is_last:
+                    partition.pending_last_indexes.update(batch_global_indexes)
+                    partition.has_pending_last = True
+                    if data_fields:
+                        partition.pending_last_fields.update(data_fields)
+
+            if is_last:
+                # get_meta(insert) and the data's NOTIFY are separate RPCs; if the
+                # notify arrived first its completion check was a no-op, so re-check
+                # now that has_pending_last is set (no-op if data not ready yet).
+                partition._maybe_mark_production_completed()
+
             return self.generate_batch_meta(partition_id, batch_global_indexes, data_fields, mode)
 
         if mode == "fetch":
@@ -1333,19 +1509,9 @@ class TransferQueueController:
                         # "batch_index": batch_index, "partition_id": partition_id}).
                         # Passing them again here causes a "multiple values for
                         # keyword argument" TypeError.
-                        # production_done: every pre-allocated sample of this
-                        # partition has been produced for the requested fields,
-                        # so no more data is coming.  The streaming sampler uses
-                        # this to trigger its end-of-stream tail flush (dump all
-                        # remaining ready samples even if they can't form a full
-                        # balance unit), preventing a tail livelock under DP>1.
-                        production_done = False
-                        try:
-                            _, prod = partition.get_production_status_for_fields(data_fields, mask=True)
-                            if prod is not None and prod.numel() > 0:
-                                production_done = bool((prod == 1).all().item())
-                        except Exception:
-                            production_done = False
+                        # Downstream fields may be backfilled after producer EOS;
+                        # only cache EOS once the requested fields are ready.
+                        production_done = partition.are_unconsumed_fields_ready(task_name, data_fields)
 
                         batch_global_indexes, consumed_indexes = self.sampler(
                             ready_for_consume_indexes,
@@ -1360,21 +1526,10 @@ class TransferQueueController:
                     if batch_global_indexes:
                         break
 
-                    # Sampler returned nothing. Two possibilities:
-                    # 1) Partition still has unconsumed samples but not enough for a
-                    #    balance round → wait for more production.
-                    # 2) Partition is fully consumed (production complete AND every
-                    #    allocated sample marked consumed) → signal end-of-stream.
-                    if partition is not None:
-                        _, cons = partition.get_consumption_status(task_name, mask=True)
-                        if (
-                            partition.production_status is not None
-                            and cons.numel() > 0
-                            and bool((cons == 1).all().item())
-                        ):
-                            # True end-of-stream: everything produced has been
-                            # consumed.  Signal drain completion.
-                            return BatchMeta.empty()
+                    # Sampler empty: either still producing (wait), or fully drained
+                    # (producer done AND all inserted samples consumed) → end-of-stream.
+                    if partition is not None and partition.is_stream_drained(task_name):
+                        return BatchMeta.empty()
 
                     # Bounded wait: short backoff inside the handler so other
                     # consumers' GET_META requests aren't starved.  When the
@@ -1923,6 +2078,7 @@ class TransferQueueController:
                         task_name=params.get("task_name"),
                         sampling_config=params.get("sampling_config", {}),
                         token_budget=params.get("token_budget"),
+                        is_last=params.get("is_last", False),
                     )
 
                     response_msg = ZMQMessage.create(
@@ -2050,6 +2206,34 @@ class TransferQueueController:
                             "partition_id": params["partition_id"],
                             "global_index": global_index,
                             "consumption_status": consumption_status,
+                        },
+                    )
+
+            elif request_msg.request_type == ZMQRequestType.CHECK_STREAM_DRAINED:
+                with perf_monitor.measure(op_type="CHECK_STREAM_DRAINED"):
+                    params = request_msg.body
+                    drained = self.check_stream_drained(params["partition_id"], params["task_name"])
+                    response_msg = ZMQMessage.create(
+                        request_type=ZMQRequestType.CHECK_STREAM_DRAINED_RESPONSE,
+                        sender_id=self.controller_id,
+                        receiver_id=request_msg.sender_id,
+                        body={
+                            "partition_id": params["partition_id"],
+                            "drained": drained,
+                        },
+                    )
+
+            elif request_msg.request_type == ZMQRequestType.CHECK_PRODUCTION_COMPLETED:
+                with perf_monitor.measure(op_type="CHECK_PRODUCTION_COMPLETED"):
+                    params = request_msg.body
+                    completed = self.check_production_completed(params["partition_id"])
+                    response_msg = ZMQMessage.create(
+                        request_type=ZMQRequestType.CHECK_PRODUCTION_COMPLETED_RESPONSE,
+                        sender_id=self.controller_id,
+                        receiver_id=request_msg.sender_id,
+                        body={
+                            "partition_id": params["partition_id"],
+                            "completed": completed,
                         },
                     )
 

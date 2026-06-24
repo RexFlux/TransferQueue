@@ -1420,6 +1420,68 @@ class TestStreamingTokenBudgetSampler:
         assert sorted(drained) == [0, 1, 2, 3]
         assert len(drained) == len(set(drained))
 
+    def test_eos_drains_all_across_rounds_within_budget(self):
+        """Regression for the step-50 drain hang AND the EOS OOM.
+
+        At end-of-stream every produced sample must eventually be delivered (and
+        marked consumed) — but NO single micro-batch may exceed the token budget
+        (popping a whole bucket at once built a 17-sample mb → OOM). So a dp whose
+        bucket holds several budgets of residue is drained across SUCCESSIVE
+        batch_index rounds, each mb ≤ budget. This models the real consumer: each
+        dp advances its OWN batch_index on every non-empty fetch and stops when
+        the global partition is fully consumed.
+        """
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=2, balance_unit_multiplier=4)
+        all_indexes = list(range(8))  # 4 GRPO groups
+        # Long per-sample length so each budget slice fits exactly ONE sample,
+        # forcing multi-round drain of any multi-sample bucket.
+        per_sample_len = 900
+        partition = self._partition_with_uniform_lengths(all_indexes, per_sample_len)
+        dp_size = 2
+        token_budget = 1000  # one 900-token sample fits; two (1800) do not
+
+        # All dps step through batch_index in lockstep (the sampler atomically
+        # prepares every dp's slice for a batch_index on first touch); we advance
+        # to the next batch_index once a round has been served, and stop when a
+        # whole round yields nothing.
+        drained: list[int] = []
+        for batch_index in range(20):  # bounded; must finish well within
+            # Model the controller: consumed samples are filtered OUT of the ready
+            # pool (scan_data_status excludes consumption_status==1), so already
+            # drained indexes are never re-offered.
+            ready_now = [i for i in all_indexes if i not in drained]
+            round_total = 0
+            for dp_rank in range(dp_size):
+                sampled, consumed = sampler.sample(
+                    ready_now,
+                    0,
+                    task_name="actor",
+                    partition_id="p0",
+                    dp_rank=dp_rank,
+                    dp_size=dp_size,
+                    batch_index=batch_index,
+                    partition=partition,
+                    token_budget=token_budget,
+                    production_done=True,
+                )
+                assert sampled == consumed
+                if sampled:
+                    # OOM guard: each delivered mb must respect the token budget.
+                    mb_tokens = len(sampled) * per_sample_len
+                    assert mb_tokens <= token_budget, f"oversized mb: {len(sampled)} samples = {mb_tokens} tok"
+                    drained.extend(sampled)
+                    round_total += len(sampled)
+            if round_total == 0:
+                break  # whole round empty → fully drained
+
+        # Every produced sample consumed exactly once across the multi-round drain.
+        assert sorted(drained) == all_indexes, f"orphaned: {set(all_indexes) - set(drained)}"
+        assert len(drained) == len(set(drained))
+        # Nothing left bucketed / assigned-but-unconsumed.
+        for bucket in sampler._buckets[("p0", "actor")].values():
+            assert bucket == [], f"residue left in bucket: {bucket}"
+        assert sampler._assigned_global[("p0", "actor")] == set()
+
     def test_tail_flush_assigns_all_to_buckets(self):
         """First production_done call must assign all ready samples to buckets."""
         sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=2, balance_unit_multiplier=4)
@@ -1448,6 +1510,65 @@ class TestStreamingTokenBudgetSampler:
         # All four samples are accounted for (either popped this call or bucketed).
         popped = set(range(4)) - assigned
         assert (assigned | popped) == {0, 1, 2, 3}
+
+    def test_eos_waits_for_downstream_fields_before_empty_cache(self):
+        """EOS waits for downstream fields before caching an empty result."""
+        from transfer_queue.controller import DataPartitionStatus
+
+        def schema(field_name: str) -> dict[str, dict[str, Any]]:
+            return {field_name: {"dtype": "torch.float32", "shape": (4,), "is_nested": False, "is_non_tensor": False}}
+
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=1)
+        partition = DataPartitionStatus(partition_id="train_0")
+        partition.global_indexes.update([0, 1])
+        partition.actual_sample_count = 2
+        partition.pending_last_indexes.update([0, 1])
+        partition.has_pending_last = True
+        partition.pending_last_fields.update(["tokens"])
+        partition.set_custom_meta({0: {"total_lengths": 5}, 1: {"total_lengths": 5}})
+        partition.update_production_status([0, 1], ["tokens"], schema("tokens"))
+        assert partition.production_completed is True
+
+        data_fields = ["tokens", "advantages"]
+        production_done = partition.are_unconsumed_fields_ready("actor_train", data_fields)
+        assert production_done is False
+
+        sampled, consumed = sampler.sample(
+            [],
+            0,
+            task_name="actor_train",
+            partition_id="train_0",
+            dp_rank=0,
+            dp_size=1,
+            batch_index=0,
+            partition=partition,
+            token_budget=10,
+            production_done=production_done,
+        )
+        assert sampled == []
+        assert consumed == []
+        assert sampler._states == {}
+
+        partition.update_production_status([0, 1], ["advantages"], schema("advantages"))
+        ready = partition.scan_data_status(data_fields, "actor_train")
+        assert ready == [0, 1]
+        production_done = partition.are_unconsumed_fields_ready("actor_train", data_fields)
+        assert production_done is True
+
+        sampled, consumed = sampler.sample(
+            ready,
+            0,
+            task_name="actor_train",
+            partition_id="train_0",
+            dp_rank=0,
+            dp_size=1,
+            batch_index=0,
+            partition=partition,
+            token_budget=10,
+            production_done=production_done,
+        )
+        assert sampled == [0, 1]
+        assert consumed == [0, 1]
 
     def test_no_complete_group_without_production_done_returns_empty(self):
         """No complete GRPO group + not end-of-stream → return empty (wait for more)."""
