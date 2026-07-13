@@ -21,8 +21,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from itertools import groupby
 from operator import itemgetter
-from threading import Thread
-from typing import TYPE_CHECKING, Any
+from threading import Lock, Thread
+from typing import TYPE_CHECKING, Any, Optional
 from uuid import uuid4
 
 import numpy as np

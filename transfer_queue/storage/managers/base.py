@@ -21,7 +21,7 @@ import time
 import weakref
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 from uuid import uuid4
 
 import ray

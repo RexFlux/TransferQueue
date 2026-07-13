@@ -30,18 +30,14 @@ from tensordict import NonTensorStack, TensorDict
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.managers.base import StorageManager, StorageManagerFactory
 from transfer_queue.utils.logging_utils import get_logger
-from transfer_queue.storage.managers.base import TransferQueueStorageManager
-from transfer_queue.storage.managers.factory import TransferQueueStorageManagerFactory
 from transfer_queue.utils.socket_pool import (
     SocketPoolManager,
-    invoke_with_pool,
 )
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,
     with_zmq_socket,
-    format_zmq_address,
 )
 
 logger = get_logger(__name__)
@@ -95,8 +91,8 @@ class AsyncSimpleStorageManager(StorageManager):
             raise ValueError("AsyncSimpleStorageManager requires non-empty 'zmq_info' in config.")
 
         self.storage_unit_infos = self._register_servers(server_infos)
-        # Owns the long-lived DEALER pools used by
-        # ``dynamic_storage_manager_socket``; released by ``close()``.
+        # Owns the long-lived DEALER pools used by the ``with_zmq_socket``
+        # request path; released by ``close()``.
         self._socket_pool_manager = SocketPoolManager()
 
     def _register_servers(self, server_infos: "ZMQServerInfo | dict[Any, ZMQServerInfo]"):
@@ -125,87 +121,6 @@ class AsyncSimpleStorageManager(StorageManager):
             raise ValueError(f"Invalid server infos: {server_infos}")
 
         return server_infos_transform
-
-    @staticmethod
-    def dynamic_storage_manager_socket(socket_name: str, timeout: int):
-        """Decorator: route each call through a long-lived DEALER pool.
-
-        The pool is keyed by ``(current_loop, storage_unit_key, socket_name)``
-        and grows lazily up to ``TQ_POOL_SIZE``. Each call is wrapped in
-        ``asyncio.wait_for(timeout)`` and retried up to
-        ``TQ_REQUEST_MAX_ATTEMPTS`` times on failure, with the suspect
-        socket dropped between attempts. See ``transfer_queue.utils.socket_pool``
-        for the rationale (TIME_WAIT exhaustion under high-throughput
-        async RL training, and ROUTER reply mis-routing protection).
-
-        The ``timeout`` argument is applied at both layers:
-          * ``asyncio.wait_for`` (asyncio-level, around the whole call)
-          * ZMQ ``RCVTIMEO``/``SNDTIMEO`` on each pooled socket (libzmq-
-            level, so a runaway recv cannot block libzmq IO either)
-
-        Args:
-            socket_name (str): Port name (from server config) to use for
-                ZMQ connection (e.g., ``"put_get_socket"``).
-            timeout (int): Per-call timeout in seconds.
-
-        Decorated Function Rules:
-            1. Must be an async class method (needs ``self``).
-            2. ``self`` requires:
-               - ``storage_unit_infos``: storage unit infos
-                 (ZMQServerInfo | dict[Any, ZMQServerInfo]).
-            3. Specify target server via the ``target_storage_unit`` arg.
-            4. Receives ZMQ socket via ``socket`` keyword arg (injected
-               by decorator).
-        """
-
-        def decorator(func: Callable):
-            @wraps(func)
-            async def wrapper(self, *args, **kwargs):
-                server_key = kwargs.get("target_storage_unit")
-                if server_key is None:
-                    for arg in args:
-                        if isinstance(arg, str) and arg in self.storage_unit_infos.keys():
-                            server_key = arg
-                            break
-
-                server_info = self.storage_unit_infos.get(server_key)
-                if not server_info:
-                    raise RuntimeError(f"Server {server_key} not found in registered servers")
-
-                # See ``AsyncTransferQueueClient.dynamic_socket`` for why
-                # ``loop_id`` must be in the identity prefix: cross-loop
-                # DEALER identity collision otherwise misroutes replies.
-                loop_id = id(asyncio.get_running_loop())
-                identity_prefix = f"{self.storage_manager_id}_to_{server_info.id}_loop{loop_id}"
-                address = format_zmq_address(server_info.ip, server_info.ports.get(socket_name))
-
-                def _on_create(sock):
-                    # libzmq-level fallback in addition to asyncio.wait_for.
-                    sock.setsockopt(zmq.RCVTIMEO, timeout * 1000)
-                    sock.setsockopt(zmq.SNDTIMEO, timeout * 1000)
-
-                pool = self._socket_pool_manager.get_or_create(
-                    pool_key=(server_key, socket_name),
-                    address=address,
-                    ip=server_info.ip,
-                    identity_prefix=identity_prefix,
-                    on_create=_on_create,
-                )
-
-                async def _call(sock):
-                    kwargs["socket"] = sock
-                    return await func(self, *args, **kwargs)
-
-                return await invoke_with_pool(
-                    pool,
-                    _call,
-                    timeout=float(timeout),
-                    label=f"{self.storage_manager_id} {socket_name}.{func.__name__}",
-                )
-
-            return wrapper
-
-        return decorator
 
     def _group_by_hash(self, global_indexes: list[int]) -> dict[str, RoutingGroup]:
         """Group samples by global_idx % num_su, return {storage_id: RoutingGroup}.

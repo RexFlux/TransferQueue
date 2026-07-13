@@ -16,7 +16,6 @@
 import asyncio
 import os
 import threading
-from functools import wraps
 from typing import Any, Callable, Optional
 
 import torch
@@ -30,25 +29,35 @@ from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.socket_pool import (
     SocketPoolManager,
-    invoke_with_pool,
 )
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,
     with_zmq_socket,
-    format_zmq_address,
 )
 
 logger = get_logger(__name__)
 
 TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
 
+# Controller checkpoint save/load may serialize a large in-memory state, so it
+# gets a generous timeout instead of the pool's default (``TQ_REQUEST_TIMEOUT_S``).
+TQ_CONTROLLER_CHECKPOINT_TIMEOUT_S = int(os.environ.get("TQ_CONTROLLER_CHECKPOINT_TIMEOUT_S", 600))
+
 # Pre-bound decorator for controller socket operations.
 with_controller_socket = with_zmq_socket(
     "request_handle_socket",
     get_identity=lambda self: self.client_id,
     get_peer=lambda self, target: self._controller,
+)
+
+# Like ``with_controller_socket`` but with a longer timeout for slow checkpoint RPCs.
+with_controller_checkpoint_socket = with_zmq_socket(
+    "request_handle_socket",
+    get_identity=lambda self: self.client_id,
+    get_peer=lambda self, target: self._controller,
+    timeout=TQ_CONTROLLER_CHECKPOINT_TIMEOUT_S,
 )
 
 
@@ -76,8 +85,8 @@ class AsyncTransferQueueClient:
             raise TypeError(f"controller_info must be ZMQServerInfo, got {type(controller_info)}")
         self.client_id = client_id
         self._controller: ZMQServerInfo = controller_info
-        # Owns the long-lived DEALER pools used by ``dynamic_socket``;
-        # released by ``close()``.
+        # Owns the long-lived DEALER pools used by the ``with_zmq_socket``
+        # request path; released by ``close()``.
         self._socket_pool_manager = SocketPoolManager()
         logger.info(f"[{self.client_id}]: Registered Controller server {controller_info.id} at {controller_info.ip}")
 
@@ -99,71 +108,6 @@ class AsyncTransferQueueClient:
         self.storage_manager = StorageManagerFactory.create(
             manager_type, controller_info=self._controller, config=config
         )
-
-    @staticmethod
-    def dynamic_socket(socket_name: str):
-        """Decorator: route each call through a long-lived DEALER pool.
-
-        The pool is keyed by ``(current_loop, controller_id, socket_name)``
-        and grows lazily up to ``TQ_POOL_SIZE``. Each call is wrapped in
-        ``asyncio.wait_for(TQ_REQUEST_TIMEOUT_S)`` and retried up to
-        ``TQ_REQUEST_MAX_ATTEMPTS`` times on failure, with the suspect
-        socket dropped between attempts. See ``transfer_queue.utils.socket_pool``
-        for the rationale (TIME_WAIT exhaustion under high-throughput
-        async RL training, and ROUTER reply mis-routing protection).
-
-        Args:
-            socket_name: Port name from server config to use for ZMQ
-                connection (e.g., ``"request_handle_socket"``).
-
-        Decorated Function Requirements:
-            1. Must be an async class method (needs ``self``).
-            2. ``self`` must have:
-               - ``_controller``: ZMQServerInfo of the controller.
-               - ``client_id``: Unique client ID for socket identity.
-            3. Receives ZMQ socket via ``socket`` keyword argument
-               (injected by decorator).
-        """
-
-        def decorator(func: Callable):
-            @wraps(func)
-            async def wrapper(self, *args, **kwargs):
-                server_info = self._controller
-                if not server_info:
-                    raise RuntimeError("No controller registered")
-
-                # ``loop_id`` MUST be in the identity prefix. Some callers
-                # drive the same client instance from two asyncio loops
-                # (e.g. a bg loop for sync wrappers + a shared loop for
-                # async calls). Without loop_id, both pools' "first
-                # socket" would share the identity ``{client_id}_to_
-                # {server_id}-0`` and the ROUTER would route replies
-                # non-deterministically between them — one side's recv
-                # then hangs forever.
-                loop_id = id(asyncio.get_running_loop())
-                identity_prefix = f"{self.client_id}_to_{server_info.id}_loop{loop_id}"
-                address = format_zmq_address(server_info.ip, server_info.ports.get(socket_name))
-
-                pool = self._socket_pool_manager.get_or_create(
-                    pool_key=(server_info.id, socket_name),
-                    address=address,
-                    ip=server_info.ip,
-                    identity_prefix=identity_prefix,
-                )
-
-                async def _call(sock):
-                    kwargs["socket"] = sock
-                    return await func(self, *args, **kwargs)
-
-                return await invoke_with_pool(
-                    pool,
-                    _call,
-                    label=f"{self.client_id} {socket_name}.{func.__name__}",
-                )
-
-            return wrapper
-
-        return decorator
 
     # ==================== Basic API ====================
     @with_controller_socket
@@ -1325,7 +1269,7 @@ class AsyncTransferQueueClient:
             logger.warning(f"Error closing storage manager: {e}")
 
     # ==================== Checkpoint API ====================
-    @with_controller_socket
+    @with_controller_checkpoint_socket
     async def async_save_controller_checkpoint(
         self,
         path: str,
@@ -1364,7 +1308,7 @@ class AsyncTransferQueueClient:
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in save_controller_checkpoint: {str(e)}") from e
 
-    @with_controller_socket
+    @with_controller_checkpoint_socket
     async def async_load_controller_checkpoint(
         self,
         path: str,

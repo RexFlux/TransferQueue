@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import socket
 import time
 from dataclasses import dataclass
@@ -336,11 +337,19 @@ def with_zmq_socket(
     resolve_target: Callable[[tuple, dict], str | None] | None = None,
     timeout: int | None = None,
 ):
-    """Create a reusable async decorator for request sockets.
+    """Create a reusable async decorator that routes requests through a socket pool.
 
-    This decorator encapsulates the common socket lifecycle used by both
-    client-side and storage-manager-side request paths:
-    create context/socket -> connect -> inject socket -> close/term.
+    This decorator encapsulates the common request path used by both the
+    client side and the storage-manager side: it resolves the target server,
+    acquires a long-lived DEALER from ``self._socket_pool_manager`` keyed by
+    ``(loop, server_id, socket_name)``, injects it as the ``socket`` kwarg, and
+    runs the call under ``invoke_with_pool`` (per-call ``asyncio.wait_for`` +
+    drop-and-retry on failure). See ``transfer_queue.utils.socket_pool`` for the
+    rationale (TIME_WAIT exhaustion under high-throughput async RL training, and
+    ROUTER reply mis-routing protection).
+
+    ``self`` must own a ``_socket_pool_manager`` (a
+    :class:`~transfer_queue.utils.socket_pool.SocketPoolManager`).
 
     Args:
         socket_name: Socket port key in ``ZMQServerInfo.ports``.
@@ -353,12 +362,20 @@ def with_zmq_socket(
         resolve_target: Optional callable that extracts target identifier from
             function arguments. Receives (args, kwargs) and returns target name.
             Example: ``lambda args, kwargs: kwargs.get("target_storage_unit")``
-        timeout: Optional timeout (seconds) for both send/recv operations.
+        timeout: Optional per-call timeout (seconds). When set it is applied at
+            both layers: ``asyncio.wait_for`` (around the whole call) and ZMQ
+            ``RCVTIMEO``/``SNDTIMEO`` on each pooled socket. When ``None`` the
+            pool's default (``TQ_REQUEST_TIMEOUT_S``) is used and no per-socket
+            libzmq timeout is set.
     """
 
     def decorator(func: Callable):
         @wraps(func)
         async def wrapper(self, *args, **kwargs):
+            # Deferred import: socket_pool imports create_zmq_socket from this
+            # module, so importing it at module scope would be circular.
+            from transfer_queue.utils.socket_pool import invoke_with_pool
+
             owner_id = get_identity(self)
             if owner_id is None:
                 raise RuntimeError("get_identity returned None")
@@ -375,27 +392,38 @@ def with_zmq_socket(
             if port is None:
                 raise RuntimeError(f"Socket '{socket_name}' not configured for server '{server_info.id}'")
 
-            context = zmq.asyncio.Context()
-            sock = None
-            try:
-                address = format_zmq_address(server_info.ip, port)
-                identity = f"{owner_id}_to_{server_info.id}_{uuid4().hex[:8]}".encode()
-                sock = create_zmq_socket(context, zmq.DEALER, server_info.ip, identity=identity)
-                sock.connect(address)
-                if timeout is not None:
+            # ``loop_id`` MUST be in the identity prefix: components that drive
+            # the same instance from two asyncio loops (e.g. a bg loop for sync
+            # wrappers + a shared loop for async calls) would otherwise hand the
+            # same DEALER identity to one ROUTER from two loops, misrouting replies.
+            loop_id = id(asyncio.get_running_loop())
+            identity_prefix = f"{owner_id}_to_{server_info.id}_loop{loop_id}"
+            address = format_zmq_address(server_info.ip, port)
+
+            on_create = None
+            if timeout is not None:
+                # libzmq-level fallback in addition to asyncio.wait_for, so a
+                # runaway recv cannot block libzmq IO either.
+                def on_create(sock):
                     sock.setsockopt(zmq.RCVTIMEO, timeout * 1000)
                     sock.setsockopt(zmq.SNDTIMEO, timeout * 1000)
+
+            pool = self._socket_pool_manager.get_or_create(
+                pool_key=(server_info.id, socket_name),
+                address=address,
+                ip=server_info.ip,
+                identity_prefix=identity_prefix,
+                on_create=on_create,
+            )
+
+            async def _call(sock):
                 kwargs["socket"] = sock
                 return await func(self, *args, **kwargs)
-            finally:
-                if sock is not None:
-                    try:
-                        if not sock.closed:
-                            sock.close(linger=-1)
-                    finally:
-                        context.term()
-                else:
-                    context.term()
+
+            invoke_kwargs: dict[str, Any] = {"label": f"{owner_id} {socket_name}.{func.__name__}"}
+            if timeout is not None:
+                invoke_kwargs["timeout"] = float(timeout)
+            return await invoke_with_pool(pool, _call, **invoke_kwargs)
 
         return wrapper
 
