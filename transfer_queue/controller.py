@@ -1305,6 +1305,30 @@ class TransferQueueController:
             return False
         return partition.is_stream_drained(task_name)
 
+    def check_window_drained(self, partition_id: str, task_name: str, window_id: int, window_quota: int | None) -> bool:
+        """Per-window end-of-stream test for a (partition, task, window).
+
+        Returns True iff the sampler has globally dispatched ``window_quota``
+        samples for ``window_id`` (a rollout-mini window), OR the whole partition
+        is drained (covers an under-produced final window whose quota can never
+        be reached).  Falls back to the partition-level test when the active
+        sampler has no per-window notion (e.g. a non-streaming sampler).
+        """
+        partition = self._get_partition(partition_id)
+        if not partition:
+            return False
+        is_window_drained = getattr(self.sampler, "is_window_drained", None)
+        if is_window_drained is None:
+            return partition.is_stream_drained(task_name)
+        return is_window_drained(
+            partition_id,
+            task_name,
+            window_id,
+            window_quota,
+            production_done=bool(partition.production_completed),
+            partition_drained=partition.is_stream_drained(task_name),
+        )
+
     def check_production_completed(self, partition_id: str) -> bool:
         """Producer-side completion test for a partition (no consumption involved).
 
@@ -1529,6 +1553,29 @@ class TransferQueueController:
                     # Sampler empty: either still producing (wait), or fully drained
                     # (producer done AND all inserted samples consumed) → end-of-stream.
                     if partition is not None and partition.is_stream_drained(task_name):
+                        return BatchMeta.empty()
+
+                    # Per-window end-of-stream: this rollout-mini window has met its
+                    # global dispatch quota even though the partition (later windows)
+                    # is still producing.  Return empty now instead of blocking until
+                    # the timeout, so the consumer's per-window drain finishes promptly.
+                    w_id = sampling_config.get("rollout_mini_index")
+                    w_quota = sampling_config.get("window_quota")
+                    is_window_drained = getattr(self.sampler, "is_window_drained", None)
+                    if (
+                        partition is not None
+                        and w_id is not None
+                        and w_quota is not None
+                        and is_window_drained is not None
+                        and is_window_drained(
+                            partition_id,
+                            task_name,
+                            w_id,
+                            w_quota,
+                            production_done=bool(partition.production_completed),
+                            partition_drained=partition.is_stream_drained(task_name),
+                        )
+                    ):
                         return BatchMeta.empty()
 
                     # Bounded wait: short backoff inside the handler so other
@@ -2215,6 +2262,25 @@ class TransferQueueController:
                     drained = self.check_stream_drained(params["partition_id"], params["task_name"])
                     response_msg = ZMQMessage.create(
                         request_type=ZMQRequestType.CHECK_STREAM_DRAINED_RESPONSE,
+                        sender_id=self.controller_id,
+                        receiver_id=request_msg.sender_id,
+                        body={
+                            "partition_id": params["partition_id"],
+                            "drained": drained,
+                        },
+                    )
+
+            elif request_msg.request_type == ZMQRequestType.CHECK_WINDOW_DRAINED:
+                with perf_monitor.measure(op_type="CHECK_WINDOW_DRAINED"):
+                    params = request_msg.body
+                    drained = self.check_window_drained(
+                        params["partition_id"],
+                        params["task_name"],
+                        params["window_id"],
+                        params.get("window_quota"),
+                    )
+                    response_msg = ZMQMessage.create(
+                        request_type=ZMQRequestType.CHECK_WINDOW_DRAINED_RESPONSE,
                         sender_id=self.controller_id,
                         receiver_id=request_msg.sender_id,
                         body={

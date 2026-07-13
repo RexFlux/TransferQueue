@@ -1847,5 +1847,166 @@ class TestSamplerIntegration:
                 pass
 
 
+class TestStreamingTokenBudgetSamplerWindowQuota:
+    """Per-window global dispatch quota + is_window_drained (multi-mini)."""
+
+    @staticmethod
+    def _partition(indexes, length=10):
+        return TestStreamingTokenBudgetSampler.MockPartition({i: {"total_lengths": length} for i in indexes})
+
+    @staticmethod
+    def _drive_window(
+        sampler,
+        partition,
+        ready,
+        *,
+        window_id,
+        window_quota,
+        dp_size,
+        start_batch_index,
+        consumed_all=None,
+        max_rounds=50,
+    ):
+        """Pop from a window across successive batch_indexes until it stops
+        dispatching, returning the total samples handed out across all DPs.
+
+        Mirrors the controller: consumed samples are removed from the ready pool
+        so they never reappear in a later fetch's ``ready_indexes``. Pass a shared
+        ``consumed_all`` set to carry consumption across consecutive windows.
+        """
+        if consumed_all is None:
+            consumed_all = set()
+        total = 0
+        for r in range(max_rounds):
+            batch_index = start_batch_index + r
+            got_this_round = 0
+            for dp_rank in range(dp_size):
+                sampled, consumed = sampler.sample(
+                    [i for i in ready if i not in consumed_all],
+                    0,
+                    task_name="actor_train",
+                    partition_id="train_0",
+                    token_budget=10,  # 1 sample per token-budget slice (length=10)
+                    dp_rank=dp_rank,
+                    dp_size=dp_size,
+                    partition=partition,
+                    batch_index=batch_index,
+                    rollout_mini_index=window_id,
+                    window_quota=window_quota,
+                    production_done=False,
+                )
+                consumed_all.update(consumed)
+                got_this_round += len(sampled)
+            total += got_this_round
+            if got_this_round == 0:
+                break
+        return total
+
+    def test_window_dispatch_capped_at_quota(self):
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=2)
+        ready = list(range(16))  # 16 ready, quota 8 → only 8 dispatched for window 0
+        partition = self._partition(ready)
+
+        total = self._drive_window(
+            sampler, partition, ready, window_id=0, window_quota=8, dp_size=2, start_batch_index=0
+        )
+        assert total == 8
+        assert sampler._dispatched[("train_0", "actor_train")][0] == 8
+
+    def test_is_window_drained_flips_at_quota(self):
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=2)
+        ready = list(range(16))
+        partition = self._partition(ready)
+
+        assert not sampler.is_window_drained(
+            "train_0", "actor_train", 0, window_quota=8, production_done=False, partition_drained=False
+        )
+        self._drive_window(sampler, partition, ready, window_id=0, window_quota=8, dp_size=2, start_batch_index=0)
+        assert sampler.is_window_drained(
+            "train_0", "actor_train", 0, window_quota=8, production_done=False, partition_drained=False
+        )
+
+    def test_second_window_independent(self):
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=2)
+        ready = list(range(16))  # quota 8 per window → window 0 takes 8, window 1 the residual 8
+        partition = self._partition(ready)
+
+        consumed: set[int] = set()
+        self._drive_window(
+            sampler,
+            partition,
+            ready,
+            window_id=0,
+            window_quota=8,
+            dp_size=2,
+            start_batch_index=0,
+            consumed_all=consumed,
+        )
+        total_w1 = self._drive_window(
+            sampler,
+            partition,
+            ready,
+            window_id=1,
+            window_quota=8,
+            dp_size=2,
+            start_batch_index=1_000_000,
+            consumed_all=consumed,
+        )
+        assert total_w1 == 8
+        assert sampler._dispatched[("train_0", "actor_train")][1] == 8
+
+    def test_pp_replay_counts_once(self):
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=2)
+        ready = list(range(16))
+        partition = self._partition(ready)
+
+        common = dict(
+            task_name="actor_train",
+            partition_id="train_0",
+            token_budget=10,
+            dp_size=2,
+            partition=partition,
+            batch_index=0,
+            rollout_mini_index=0,
+            window_quota=8,
+            production_done=False,
+        )
+        sampler.sample(ready, 0, dp_rank=0, **common)
+        dispatched_after_first = sampler._dispatched[("train_0", "actor_train")][0]
+        # Same (dp, batch_index) again = PP-stage replay → cache HIT, no re-count.
+        sampler.sample(ready, 0, dp_rank=0, **common)
+        assert sampler._dispatched[("train_0", "actor_train")][0] == dispatched_after_first
+
+    def test_underproduced_final_window_drains_via_partition(self):
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=2)
+        ready = [0, 1]  # only 2 produced but quota is 8 → quota never reached
+        partition = self._partition(ready)
+        self._drive_window(sampler, partition, ready, window_id=0, window_quota=8, dp_size=2, start_batch_index=0)
+
+        # Not drained on quota alone...
+        assert not sampler.is_window_drained(
+            "train_0", "actor_train", 0, window_quota=8, production_done=False, partition_drained=False
+        )
+        # ...but drained once the partition is fully produced + consumed.
+        assert sampler.is_window_drained(
+            "train_0", "actor_train", 0, window_quota=8, production_done=True, partition_drained=True
+        )
+
+    def test_legacy_fallback_does_not_touch_dispatched(self):
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=2)
+        # No token_budget → GRPO fallback path.
+        sampler.sample([0, 1, 2, 3], batch_size=2, task_name="ref", partition_id="train_0")
+        assert sampler._dispatched == {}
+
+    def test_clear_cache_drops_dispatched(self):
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=2)
+        ready = list(range(16))
+        partition = self._partition(ready)
+        self._drive_window(sampler, partition, ready, window_id=0, window_quota=8, dp_size=2, start_batch_index=0)
+        assert ("train_0", "actor_train") in sampler._dispatched
+        sampler.clear_cache("train_0")
+        assert ("train_0", "actor_train") not in sampler._dispatched
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

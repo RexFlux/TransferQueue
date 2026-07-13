@@ -81,6 +81,14 @@ class ZMQRequestType(ExplicitEnum):
     CHECK_STREAM_DRAINED = "CHECK_STREAM_DRAINED"
     CHECK_STREAM_DRAINED_RESPONSE = "CHECK_STREAM_DRAINED_RESPONSE"
 
+    # CHECK_WINDOW_DRAINED (per-window streaming end-of-stream: the sampler has
+    # globally dispatched window_quota samples for this rollout-mini window id,
+    # OR the whole partition is drained — the latter covers an under-produced
+    # final window. Lets multi-mini consumers finish one optimizer-step window
+    # without a per-DP sample-count target.)
+    CHECK_WINDOW_DRAINED = "CHECK_WINDOW_DRAINED"
+    CHECK_WINDOW_DRAINED_RESPONSE = "CHECK_WINDOW_DRAINED_RESPONSE"
+
     # CHECK_PRODUCTION_COMPLETED (producer-side only: the partition's producer has
     # declared the final batch via is_last AND its data is ready — independent of
     # any consumption. Used as the weight-update / training-admission gate.)

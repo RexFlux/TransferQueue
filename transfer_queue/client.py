@@ -789,6 +789,59 @@ class AsyncTransferQueueClient:
             raise RuntimeError(f"[{self.client_id}]: Error in check_stream_drained: {str(e)}") from e
 
     @with_controller_socket
+    async def async_check_window_drained(
+        self,
+        task_name: str,
+        partition_id: str,
+        window_id: int,
+        window_quota: Optional[int] = None,
+        socket: Optional[zmq.asyncio.Socket] = None,
+    ) -> bool:
+        """Per-window streaming end-of-stream test (multi-mini).
+
+        Returns True iff the sampler has globally dispatched ``window_quota``
+        samples for ``window_id`` (a rollout-mini window), OR the whole partition
+        is drained (under-produced final window). Lets a multi-mini consumer
+        finish one optimizer-step window without a per-DP sample-count target.
+
+        Args:
+            task_name: Name of the task to check consumption for
+            partition_id: Partition id to check
+            window_id: Rollout-mini window id (``rollout_mini_index``)
+            window_quota: Global per-window sample count (``mini_global_samples``)
+            socket: ZMQ async socket for message transmission (injected by decorator)
+
+        Returns:
+            bool: True if this window is drained.
+        """
+        assert socket is not None
+        request_msg = ZMQMessage.create(
+            request_type=ZMQRequestType.CHECK_WINDOW_DRAINED,  # type: ignore[arg-type]
+            sender_id=self.client_id,
+            receiver_id=self._controller.id,
+            body={
+                "partition_id": partition_id,
+                "task_name": task_name,
+                "window_id": window_id,
+                "window_quota": window_quota,
+            },
+        )
+
+        try:
+            await socket.send_multipart(request_msg.serialize())
+            response_serialized = await socket.recv_multipart(copy=False)
+            response_msg = ZMQMessage.deserialize(response_serialized)
+
+            if response_msg.request_type == ZMQRequestType.CHECK_WINDOW_DRAINED_RESPONSE:
+                return bool(response_msg.body.get("drained", False))
+            raise RuntimeError(
+                f"[{self.client_id}]: Failed to check window drained from controller {self._controller.id}: "
+                f"{response_msg.body.get('message', 'Unknown error')}"
+            )
+        except Exception as e:
+            raise RuntimeError(f"[{self.client_id}]: Error in check_window_drained: {str(e)}") from e
+
+    @with_controller_socket
     async def async_check_production_completed(
         self,
         partition_id: str,
@@ -1457,6 +1510,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self._get_production_status = _make_sync(self.async_get_production_status)
         self._check_consumption_status = _make_sync(self.async_check_consumption_status)
         self._check_stream_drained = _make_sync(self.async_check_stream_drained)
+        self._check_window_drained = _make_sync(self.async_check_window_drained)
         self._check_production_completed = _make_sync(self.async_check_production_completed)
         self._check_production_status = _make_sync(self.async_check_production_status)
         self._get_partition_list = _make_sync(self.async_get_partition_list)
@@ -1783,6 +1837,31 @@ class TransferQueueClient(AsyncTransferQueueClient):
             bool: True if the partition is fully produced and fully consumed.
         """
         return self._check_stream_drained(task_name=task_name, partition_id=partition_id)
+
+    def check_window_drained(
+        self, task_name: str, partition_id: str, window_id: int, window_quota: Optional[int] = None
+    ) -> bool:
+        """Synchronously check per-window streaming end-of-stream (multi-mini).
+
+        Returns True iff the sampler has globally dispatched ``window_quota``
+        samples for ``window_id``, OR the whole partition is drained (under-
+        produced final window).
+
+        Args:
+            task_name: Name of the task to check consumption for
+            partition_id: Partition id to check
+            window_id: Rollout-mini window id (``rollout_mini_index``)
+            window_quota: Global per-window sample count (``mini_global_samples``)
+
+        Returns:
+            bool: True if this window is drained.
+        """
+        return self._check_window_drained(
+            task_name=task_name,
+            partition_id=partition_id,
+            window_id=window_id,
+            window_quota=window_quota,
+        )
 
     def check_production_completed(self, partition_id: str) -> bool:
         """Synchronously check producer-side completion for a partition.

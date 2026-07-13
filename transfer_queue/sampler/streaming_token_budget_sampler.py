@@ -100,6 +100,12 @@ class StreamingTokenBudgetSampler(GRPOGroupNSampler):
         # by _select_up_to_budget so a single sample sees a stable length
         # across calls even if custom_meta later changes.
         self._resolved_lengths: dict[tuple[str, str], dict[int, int]] = {}
+        # _dispatched[(pid, tn)][window_id] -> int count of samples popped-and-
+        # returned (globally, summed across DPs) for that rollout-mini window.
+        # Governs the per-window global dispatch cap and is_window_drained, so a
+        # window stops once mini_global_samples have been handed out across all
+        # DPs, regardless of how unevenly the token-budget split them.
+        self._dispatched: dict[tuple[str, str], dict[int, int]] = {}
 
     def sample(
         self,
@@ -144,6 +150,12 @@ class StreamingTokenBudgetSampler(GRPOGroupNSampler):
         # sample of this partition has been produced (no more data is coming).
         # At that point the tail-flush may dump all remaining ready samples.
         production_done = bool(kwargs.get("production_done", False))
+        # Per-window global dispatch cap (multi-mini streaming): window_id keys
+        # the per-window dispatched counter; window_quota is the global sample
+        # count (mini_global_samples) after which this window stops dispatching.
+        # Both absent (None) on the legacy / fwd path → no cap, no counting.
+        window_id = kwargs.get("rollout_mini_index", None)
+        window_quota = kwargs.get("window_quota", None)
 
         if dp_rank is None or dp_size is None:
             raise ValueError(
@@ -194,6 +206,8 @@ class StreamingTokenBudgetSampler(GRPOGroupNSampler):
                 ready_indexes,
                 partition,
                 production_done,
+                window_id,
+                window_quota,
             )
             return self._states.get(partition_id, {}).get(task_name, {}).get(dp_rank, {}).get(batch_index, ([], []))
 
@@ -222,6 +236,8 @@ class StreamingTokenBudgetSampler(GRPOGroupNSampler):
         ready_indexes: list[int],
         partition,
         production_done: bool = False,
+        window_id: int | None = None,
+        window_quota: int | None = None,
     ) -> None:
         """Atomically prepare and cache one micro-batch slice for every dp_rank
         at ``batch_index``.
@@ -319,17 +335,41 @@ class StreamingTokenBudgetSampler(GRPOGroupNSampler):
         # At EOS, cache an explicit empty result for an already-empty dp so the
         # dp=0 ``already`` guard stays set and batch_index isn't recomputed/frozen
         # (which would strand other dps' residue).
+        #
+        # Per-window global cap: never dispatch more than the window's remaining
+        # quota (mini_global_samples minus what this window already handed out).
+        # The last mb of a window is clamped to the exact remainder; anything
+        # left in the buckets stays there (still in ``assigned``) and carries
+        # over to the NEXT window's batch_indexes — buckets are keyed by
+        # (partition, task), not by window.  Streaming and uneven per-dp counts
+        # are preserved; only the global total per window is bounded.
+        if window_quota is not None and window_id is not None:
+            dispatched_so_far = self._dispatched.setdefault(key, {}).get(window_id, 0)
+            remaining_quota: int | None = max(window_quota - dispatched_so_far, 0)
+        else:
+            remaining_quota = None
+        popped_this_call = 0
         for dp_i in range(dp_size):
             bucket = buckets.setdefault(dp_i, [])
-            if not bucket:
+            if not bucket or (remaining_quota is not None and remaining_quota - popped_this_call <= 0):
                 if is_eos:
                     self._cache_result(partition_id, task_name, dp_i, batch_index, ([], []))
                 continue
             sel_count = self._select_up_to_budget(bucket, resolved_lengths, token_budget)
             sel_count = max(sel_count, 1)  # always make progress
+            if remaining_quota is not None:
+                sel_count = min(sel_count, remaining_quota - popped_this_call)
             result = self._pop_and_return(bucket, sel_count, assigned)
             if result[0]:
                 self._cache_result(partition_id, task_name, dp_i, batch_index, result)
+                popped_this_call += len(result[0])
+
+        # Count only what was freshly popped this call (once per batch_index via
+        # the ``already`` guard; the EOS re-prepare only pops new residue), so
+        # PP-stage replays never double-count.
+        if window_id is not None and popped_this_call:
+            window_counts = self._dispatched.setdefault(key, {})
+            window_counts[window_id] = window_counts.get(window_id, 0) + popped_this_call
 
         logger.debug(
             "[stream-sampler] batch_idx=%s prepared: per-dp cached sizes=%s remaining_avail=%d eos=%s",
@@ -591,6 +631,27 @@ class StreamingTokenBudgetSampler(GRPOGroupNSampler):
     # Cache / lifecycle
     # ------------------------------------------------------------------
 
+    def is_window_drained(
+        self,
+        partition_id: str,
+        task_name: str,
+        window_id: int,
+        window_quota: int | None,
+        production_done: bool,
+        partition_drained: bool,
+    ) -> bool:
+        """Per-window end-of-stream test.
+
+        A rollout-mini window is drained once the sampler has globally dispatched
+        its quota (``mini_global_samples``) across all DPs, OR the whole partition
+        is drained.  The partition fallback covers an under-produced FINAL window
+        whose quota can never be reached (fewer samples produced than expected).
+        """
+        dispatched = self._dispatched.get((partition_id, task_name), {}).get(window_id, 0)
+        if window_quota is not None and dispatched >= window_quota:
+            return True
+        return bool(production_done and partition_drained)
+
     def clear_cache(self, partition_id: str):
         """Drop all per-DP buckets and assignment tracking for this partition."""
         super().clear_cache(partition_id)
@@ -603,6 +664,9 @@ class StreamingTokenBudgetSampler(GRPOGroupNSampler):
         for k in list(self._resolved_lengths):
             if k[0] == partition_id:
                 del self._resolved_lengths[k]
+        for k in list(self._dispatched):
+            if k[0] == partition_id:
+                del self._dispatched[k]
         # Also clear the parent GRPO sampler's internal cache used by
         # _run_balance_round (keyed under "__streaming_internal__").
         if "__streaming_internal__" in self._states:
