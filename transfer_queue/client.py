@@ -16,7 +16,7 @@
 import asyncio
 import os
 import threading
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 import torch
 import zmq
@@ -114,14 +114,14 @@ class AsyncTransferQueueClient:
     async def async_get_meta(
         self,
         data_fields: list[str],
-        batch_size: Optional[int] = None,
+        batch_size: int | None = None,
         partition_id: str = "",
         mode: str = "fetch",
-        task_name: Optional[str] = None,
-        sampling_config: Optional[dict[str, Any]] = None,
-        token_budget: Optional[int] = None,
+        task_name: str | None = None,
+        sampling_config: dict[str, Any] | None = None,
+        token_budget: int | None = None,
         is_last: bool = False,
-        socket: Optional[zmq.asyncio.Socket] = None,
+        socket: zmq.asyncio.Socket | None = None,
     ) -> BatchMeta:
         """Asynchronously fetch data metadata from the controller via ZMQ.
 
@@ -289,7 +289,7 @@ class AsyncTransferQueueClient:
         metadata: BatchMeta | None = None,
         partition_id: str | None = None,
         data_parser: Callable[[Any], Any] | None = None,
-        custom_meta: Optional[list[dict[str, Any]]] = None,
+        custom_meta: list[dict[str, Any]] | None = None,
         is_last: bool = False,
     ) -> BatchMeta:
         """Asynchronously write data to storage units based on metadata.
@@ -689,7 +689,7 @@ class AsyncTransferQueueClient:
         self,
         task_name: str,
         partition_id: str,
-        socket: Optional[zmq.asyncio.Socket] = None,
+        socket: zmq.asyncio.Socket | None = None,
     ) -> bool:
         """Streaming end-of-stream test (no preset global batch).
 
@@ -738,8 +738,8 @@ class AsyncTransferQueueClient:
         task_name: str,
         partition_id: str,
         window_id: int,
-        window_quota: Optional[int] = None,
-        socket: Optional[zmq.asyncio.Socket] = None,
+        window_quota: int | None = None,
+        socket: zmq.asyncio.Socket | None = None,
     ) -> bool:
         """Per-window streaming end-of-stream test (multi-mini).
 
@@ -789,7 +789,7 @@ class AsyncTransferQueueClient:
     async def async_check_production_completed(
         self,
         partition_id: str,
-        socket: Optional[zmq.asyncio.Socket] = None,
+        socket: zmq.asyncio.Socket | None = None,
     ) -> bool:
         """Producer-side completion test (no preset global batch, no consumption).
 
@@ -1472,12 +1472,12 @@ class TransferQueueClient(AsyncTransferQueueClient):
     def get_meta(
         self,
         data_fields: list[str],
-        batch_size: Optional[int] = None,
+        batch_size: int | None = None,
         partition_id: str = "",
         mode: str = "fetch",
-        task_name: Optional[str] = None,
-        sampling_config: Optional[dict[str, Any]] = None,
-        token_budget: Optional[int] = None,
+        task_name: str | None = None,
+        sampling_config: dict[str, Any] | None = None,
+        token_budget: int | None = None,
     ) -> BatchMeta:
         """Synchronously fetch data metadata from the controller via ZMQ.
 
@@ -1566,8 +1566,8 @@ class TransferQueueClient(AsyncTransferQueueClient):
     def put(
         self,
         data: TensorDict,
-        metadata: Optional[BatchMeta] = None,
-        partition_id: Optional[str] = None,
+        metadata: BatchMeta | None = None,
+        partition_id: str | None = None,
         data_parser: Callable[[Any], Any] | None = None,
         is_last: bool = False,
     ) -> BatchMeta:
@@ -1638,7 +1638,9 @@ class TransferQueueClient(AsyncTransferQueueClient):
             >>> # This will create metadata in "insert" mode internally.
             >>> metadata = client.put(data=prompts_repeated_batch, partition_id=current_partition_id)
         """
-        return self._put(data=data, metadata=metadata, partition_id=partition_id, data_parser=data_parser, is_last=is_last)
+        return self._put(
+            data=data, metadata=metadata, partition_id=partition_id, data_parser=data_parser, is_last=is_last
+        )
 
     def get_data(self, metadata: BatchMeta) -> TensorDict:
         """Synchronously fetch data from storage units and organize into TensorDict.
@@ -1783,7 +1785,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         return self._check_stream_drained(task_name=task_name, partition_id=partition_id)
 
     def check_window_drained(
-        self, task_name: str, partition_id: str, window_id: int, window_quota: Optional[int] = None
+        self, task_name: str, partition_id: str, window_id: int, window_quota: int | None = None
     ) -> bool:
         """Synchronously check per-window streaming end-of-stream (multi-mini).
 

@@ -1357,6 +1357,50 @@ class TestStreamingTokenBudgetSampler:
         assert first == second
         assert first  # non-empty
 
+    def test_reprepare_does_not_mutate_served_dp_slice(self):
+        """Regression: a re-prepare triggered by ANOTHER dp's cache miss (under
+        production_done) must NOT re-pop or overwrite a dp already served for the
+        same batch_index.
+
+        Previously the production_done path dropped dp=0's guard entry (which
+        doubled as dp=0's data cache), so a re-prepare re-popped dp=0 and two PP
+        stages of dp=0 could receive DIFFERENT micro-batches → 1F1B activation /
+        packed_seq_params length mismatch (GDN cu_seqlens crash).
+        """
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=1)
+        key = ("p0", "actor")
+        # dp=0 was already served batch_index=0 by an earlier PP stage's fetch.
+        served_slice = ([1, 2], [1, 2])
+        sampler._states.setdefault("p0", {}).setdefault("actor", {}).setdefault(0, {})[0] = served_slice
+        # Residue sitting in buckets that a buggy re-prepare could wrongly grab
+        # for dp=0 (and rightly serve for dp=1).
+        sampler._buckets[key] = {0: [90, 91], 1: [92]}
+        sampler._assigned_global[key] = {90, 91, 92}
+        sampler._resolved_lengths[key] = {90: 50, 91: 50, 92: 50}
+
+        partition = self.MockPartition({})
+        common = dict(
+            task_name="actor",
+            partition_id="p0",
+            dp_size=2,
+            batch_index=0,
+            partition=partition,
+            token_budget=50,
+            production_done=True,
+        )
+
+        # dp=1 requests the SAME batch_index=0 — a cache miss — with production_done.
+        dp1_slice, _ = sampler.sample([], 0, dp_rank=1, **common)
+
+        # dp=0's frozen slice is untouched (the old bug re-popped [90] into it).
+        assert sampler._states["p0"]["actor"][0][0] == served_slice
+        # dp=1 was still served its own (different) residue slice.
+        assert dp1_slice == [92]
+        # A second PP stage of dp=0 gets the identical cached slice (sample()
+        # returns (sampled, consumed); served_slice[0] is the sampled part).
+        dp0_again, _ = sampler.sample([], 0, dp_rank=0, **common)
+        assert dp0_again == served_slice[0]
+
     def test_different_batch_index_advances_stream(self):
         """Different batch_index consumes the next slice (no re-issue)."""
         sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=1)
@@ -1912,6 +1956,10 @@ class TestStreamingTokenBudgetSamplerWindowQuota:
         )
         assert total == 8
         assert sampler._dispatched[("train_0", "actor_train")][0] == 8
+        # window_dispatched exposes the same GLOBAL count for the consumer log
+        # (no cross-DP all_reduce needed).
+        assert sampler.window_dispatched("train_0", "actor_train", 0) == 8
+        assert sampler.window_dispatched("train_0", "actor_train", 99) == 0  # untouched window
 
     def test_is_window_drained_flips_at_quota(self):
         sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=2)
@@ -2006,6 +2054,110 @@ class TestStreamingTokenBudgetSamplerWindowQuota:
         assert ("train_0", "actor_train") in sampler._dispatched
         sampler.clear_cache("train_0")
         assert ("train_0", "actor_train") not in sampler._dispatched
+
+
+class TestStreamingTokenBudgetSamplerPerRoundDummy:
+    """Per-round DUMMY/END alignment (multi-DP MoE lockstep)."""
+
+    @staticmethod
+    def _partition(indexes, length=100):
+        return TestStreamingTokenBudgetSampler.MockPartition({i: {"total_lengths": length} for i in indexes})
+
+    @staticmethod
+    def _drive_lockstep(
+        sampler, partition, ready, *, dp_size, token_budget, window_quota=None, production_done=True, max_rounds=50
+    ):
+        """Simulate the consumer for ALL dps in lockstep by batch_index.
+
+        Returns per-dp (real_count, dummy_count). At each batch_index, for every
+        dp: a non-empty slice = real; else is_dummy_round → dummy; else END for
+        that dp. Stops when every dp has ended. Consumed indexes are removed from
+        the ready pool (mirrors the controller)."""
+        real = [0] * dp_size
+        dummy = [0] * dp_size
+        ended = [False] * dp_size
+        consumed: set[int] = set()
+        for r in range(max_rounds):
+            for dp in range(dp_size):
+                if ended[dp]:
+                    continue
+                sampled, cons = sampler.sample(
+                    [i for i in ready if i not in consumed],
+                    0,
+                    task_name="actor_train",
+                    partition_id="train_0",
+                    token_budget=token_budget,
+                    dp_rank=dp,
+                    dp_size=dp_size,
+                    partition=partition,
+                    batch_index=r,
+                    rollout_mini_index=0,
+                    window_quota=window_quota,
+                    production_done=production_done,
+                )
+                if sampled:
+                    consumed.update(cons)
+                    real[dp] += 1
+                elif sampler.is_dummy_round("train_0", "actor_train", dp, r):
+                    dummy[dp] += 1
+                else:
+                    ended[dp] = True
+            if all(ended):
+                break
+        return real, dummy
+
+    def test_uneven_slices_equalized_by_dummy_rounds(self):
+        # 5 unit-length groups across dp_size=2 → tail-flush gives dp0 one extra
+        # slice (3 vs 2). token_budget=100 == length → exactly 1 sample per slice.
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=1)
+        ready = list(range(5))
+        partition = self._partition(ready, length=100)
+
+        real, dummy = self._drive_lockstep(sampler, partition, ready, dp_size=2, token_budget=100)
+
+        assert sum(real) == 5  # every produced sample dispatched (no starvation)
+        # All dps run the SAME number of micro-batches (real + dummy) → equal
+        # EP all-to-all counts → no MoE cross-collective deadlock.
+        totals = [real[dp] + dummy[dp] for dp in range(2)]
+        assert totals[0] == totals[1]
+        assert min(dummy) == 0 and max(dummy) >= 1  # the short dp padded with dummies
+
+    def test_no_dummy_when_balanced(self):
+        # 4 equal-length groups split evenly → equal slices → no dummy rounds.
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=1)
+        ready = list(range(4))
+        partition = self._partition(ready, length=100)
+
+        real, dummy = self._drive_lockstep(sampler, partition, ready, dp_size=2, token_budget=100)
+
+        assert sum(real) == 4
+        assert real[0] == real[1]
+        assert dummy == [0, 0]
+
+    def test_quota_before_eos_still_pads_dummy(self):
+        # Regression for the fully-async MoE hang: the producer runs ahead, so a
+        # window ends by QUOTA while production_done is still False. An odd quota
+        # (3 over dp_size=2) makes one dp need an extra real round; the trailing dp
+        # must still be DUMMY-padded on the quota-drained round — NOT ended early —
+        # so both dps run equal micro-batch counts (equal EP all-to-all → no hang).
+        sampler = StreamingTokenBudgetSampler(n_samples_per_prompt=1)
+        ready = list(range(6))
+        partition = self._partition(ready, length=100)
+
+        real, dummy = self._drive_lockstep(
+            sampler,
+            partition,
+            ready,
+            dp_size=2,
+            token_budget=100,
+            window_quota=3,
+            production_done=False,  # producer NOT done → dummy must fire on quota-drain
+        )
+
+        assert sum(real) == 3  # exactly the window quota dispatched
+        totals = [real[dp] + dummy[dp] for dp in range(2)]
+        assert totals[0] == totals[1]  # equal mb counts despite odd quota
+        assert min(dummy) == 0 and max(dummy) >= 1  # short dp padded, not ended early
 
 
 if __name__ == "__main__":

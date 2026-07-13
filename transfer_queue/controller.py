@@ -21,8 +21,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from itertools import groupby
 from operator import itemgetter
-from threading import Lock, Thread
-from typing import TYPE_CHECKING, Any, Optional
+from threading import Thread
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import numpy as np
@@ -374,10 +374,6 @@ class DataPartitionStatus:
     has_pending_last: bool = False  # is_last announced, completion not yet flipped
     pending_last_fields: set[str] = field(default_factory=set)  # producer fields from is_last batch
 
-    # Threading lock for concurrency control; only for preventing mask operation error when expanding production_status.
-    # No need to strictly lock for every read/write operation since freshness is not critical.
-    data_status_lock: Lock = field(default_factory=Lock)
-
     # Dynamic configuration - these are computed from the current state
     @property
     def total_samples_num(self) -> int:
@@ -510,8 +506,8 @@ class DataPartitionStatus:
         global_indices: list[int],
         field_names: list[str],
         field_schema: dict[str, dict[str, Any]],
-        custom_backend_meta: Optional[dict[int, dict[str, Any]]] = None,
-        user_custom_meta: Optional[dict[int, dict[str, Any]]] = None,
+        custom_backend_meta: dict[int, dict[str, Any]] | None = None,
+        user_custom_meta: dict[int, dict[str, Any]] | None = None,
     ) -> bool:
         """
         Update production status for specific samples and fields.
@@ -562,11 +558,10 @@ class DataPartitionStatus:
             if user_custom_meta:
                 self.set_custom_meta(user_custom_meta)
 
-            with self.data_status_lock:
-                # Update production status
-                if self.production_status is not None and global_indices and field_names:
-                    field_indices = [self.field_name_mapping.get(f) for f in field_names]
-                    self.production_status[torch.tensor(global_indices)[:, None], torch.tensor(field_indices)] = 1
+            # Update production status
+            if self.production_status is not None and global_indices and field_names:
+                field_indices = [self.field_name_mapping.get(f) for f in field_names]
+                self.production_status[torch.tensor(global_indices)[:, None], torch.tensor(field_indices)] = 1
 
             # Update field metadata
             self._update_field_metadata(global_indices, field_schema, custom_backend_meta)
@@ -593,31 +588,29 @@ class DataPartitionStatus:
         No-op until the producer marked a final batch (``has_pending_last``).
         Only the producer's declared fields (``pending_last_fields``) are required
         — not downstream-backfilled columns (advantages, ref_log_probs) that the
-        producer never writes. Locked: reached from the NOTIFY_DATA_UPDATE thread
-        and the GET_META insert path concurrently.
+        producer never writes. Reached from the NOTIFY_DATA_UPDATE / GET_META insert
+        path, which is serialized on the single request-handling thread.
         """
-        with self.data_status_lock:
-            if self.production_completed or not self.has_pending_last:
-                return
-            if not self.pending_last_indexes:
-                return
-            if self.production_status is None or self.total_fields_num == 0:
-                return
-            idx = sorted(self.pending_last_indexes)
-            # is_last indexes may exceed the tensor if an earlier batch's notify
-            # arrives before the final batch's data grows it → not ready yet.
-            if idx[-1] >= self.allocated_samples_num:
-                return
-            col_indices = [self.field_name_mapping[f] for f in self.pending_last_fields if f in self.field_name_mapping]
-            if not col_indices:
-                return
-            rows = self.production_status[torch.tensor(idx)][:, torch.tensor(sorted(col_indices))]
-            if bool((rows == 1).all().item()):
-                self.production_completed = True
-                logger.debug(
-                    f"Partition {self.partition_id}: production_completed "
-                    f"(actual_sample_count={self.actual_sample_count})"
-                )
+        if self.production_completed or not self.has_pending_last:
+            return
+        if not self.pending_last_indexes:
+            return
+        if self.production_status is None or self.total_fields_num == 0:
+            return
+        idx = sorted(self.pending_last_indexes)
+        # is_last indexes may exceed the tensor if an earlier batch's notify
+        # arrives before the final batch's data grows it → not ready yet.
+        if idx[-1] >= self.allocated_samples_num:
+            return
+        col_indices = [self.field_name_mapping[f] for f in self.pending_last_fields if f in self.field_name_mapping]
+        if not col_indices:
+            return
+        rows = self.production_status[torch.tensor(idx)][:, torch.tensor(sorted(col_indices))]
+        if bool((rows == 1).all().item()):
+            self.production_completed = True
+            logger.debug(
+                f"Partition {self.partition_id}: production_completed (actual_sample_count={self.actual_sample_count})"
+            )
 
     def _update_field_metadata(
         self,
@@ -666,11 +659,10 @@ class DataPartitionStatus:
                 # a high index never silently drops a consumed mark (→ drain deadlock).
                 required_len = max(global_indices) + 1
                 if consumption_status.shape[0] < required_len:
-                    with self.data_status_lock:
-                        grown = torch.zeros(required_len, dtype=consumption_status.dtype)
-                        grown[: consumption_status.shape[0]] = consumption_status
-                        self.consumption_status[task_name] = grown
-                        consumption_status = grown
+                    grown = torch.zeros(required_len, dtype=consumption_status.dtype)
+                    grown[: consumption_status.shape[0]] = consumption_status
+                    self.consumption_status[task_name] = grown
+                    consumption_status = grown
                 if consumption_status.numel() > 0:
                     consumption_status[global_indices] = 1
         except Exception as e:
@@ -1236,8 +1228,8 @@ class TransferQueueController:
         partition_id: str,
         global_indexes: list[int],
         field_schema: dict[str, dict[str, Any]],
-        custom_backend_meta: Optional[dict[int, dict[str, Any]]] = None,
-        user_custom_meta: Optional[dict[int, dict[str, Any]]] = None,
+        custom_backend_meta: dict[int, dict[str, Any]] | None = None,
+        user_custom_meta: dict[int, dict[str, Any]] | None = None,
     ) -> bool:
         """
         Update production status for specific samples and fields in a partition.
@@ -1343,9 +1335,7 @@ class TransferQueueController:
             return False
         return bool(partition.production_completed)
 
-    def get_production_status(
-        self, partition_id: str, data_fields: list[str]
-    ) -> tuple[Optional[Tensor], Optional[Tensor]]:
+    def get_production_status(self, partition_id: str, data_fields: list[str]) -> tuple[Tensor | None, Tensor | None]:
         """
         Check if all samples for specified fields are fully produced in a partition.
 
@@ -1410,7 +1400,7 @@ class TransferQueueController:
         mode: str = "fetch",
         task_name: str | None = None,
         batch_size: int | None = None,
-        sampling_config: Optional[dict[str, Any]] = None,
+        sampling_config: dict[str, Any] | None = None,
         token_budget: int | None = None,
         is_last: bool = False,
         *args,
@@ -1476,13 +1466,12 @@ class TransferQueueController:
             # Streaming end-of-stream bookkeeping. Only insert puts reach here, so
             # actual_sample_count counts each sample once (backfill puts carry
             # metadata and skip this branch).
-            with partition.data_status_lock:
-                partition.actual_sample_count += batch_size
-                if is_last:
-                    partition.pending_last_indexes.update(batch_global_indexes)
-                    partition.has_pending_last = True
-                    if data_fields:
-                        partition.pending_last_fields.update(data_fields)
+            partition.actual_sample_count += batch_size
+            if is_last:
+                partition.pending_last_indexes.update(batch_global_indexes)
+                partition.has_pending_last = True
+                if data_fields:
+                    partition.pending_last_fields.update(data_fields)
 
             if is_last:
                 # get_meta(insert) and the data's NOTIFY are separate RPCs; if the
@@ -1550,10 +1539,23 @@ class TransferQueueController:
                     if batch_global_indexes:
                         break
 
+                    # Sampler empty for this (dp, batch_index). First: is it a DUMMY
+                    # round (end-of-stream, this dp short this round but another dp
+                    # still got a real slice)? Carry the flag in the fetched meta so
+                    # the consumer emits a zero-grad dummy micro-batch and advances,
+                    # keeping all dps at equal micro-batch counts (MoE EP all-to-all
+                    # matches by call order). The consumer decides from the fetch —
+                    # no extra RPC.
+                    is_dummy_round = getattr(self.sampler, "is_dummy_round", None)
+                    if is_dummy_round is not None and is_dummy_round(
+                        partition_id, task_name, sampling_config.get("dp_rank"), sampling_config.get("batch_index")
+                    ):
+                        return BatchMeta.empty({"dummy_round": True})
+
                     # Sampler empty: either still producing (wait), or fully drained
                     # (producer done AND all inserted samples consumed) → end-of-stream.
                     if partition is not None and partition.is_stream_drained(task_name):
-                        return BatchMeta.empty()
+                        return BatchMeta.empty({"stream_end": True})
 
                     # Per-window end-of-stream: this rollout-mini window has met its
                     # global dispatch quota even though the partition (later windows)
@@ -1576,7 +1578,7 @@ class TransferQueueController:
                             partition_drained=partition.is_stream_drained(task_name),
                         )
                     ):
-                        return BatchMeta.empty()
+                        return BatchMeta.empty({"stream_end": True})
 
                     # Bounded wait: short backoff inside the handler so other
                     # consumers' GET_META requests aren't starved.  When the
@@ -1656,6 +1658,14 @@ class TransferQueueController:
 
         # Package into metadata
         metadata = self.generate_batch_meta(partition_id, batch_global_indexes, data_fields, mode)
+
+        # Attach the window's GLOBAL dispatched count (sum across all dps) so the
+        # streaming consumer can log window progress as (global_consumed / quota)
+        # without a cross-DP all_reduce. Token-budget / per-window path only.
+        w_id = (sampling_config or {}).get("rollout_mini_index")
+        window_dispatched = getattr(self.sampler, "window_dispatched", None)
+        if w_id is not None and window_dispatched is not None:
+            metadata.set_extra_info("window_dispatched", window_dispatched(partition_id, task_name, w_id))
 
         return metadata
 
@@ -2147,6 +2157,7 @@ class TransferQueueController:
                         global_indexes=global_indexes,
                         field_schema=message_data.get("field_schema", {}),
                         custom_backend_meta=message_data.get("custom_backend_meta", {}),
+                        user_custom_meta=message_data.get("user_custom_meta", None),
                     )
                     if success:
                         if self._metrics is not None:
@@ -2444,47 +2455,6 @@ class TransferQueueController:
                 )
 
             self.request_handle_socket.send_multipart([identity, *response_msg.serialize()])
-
-    def _update_data_status(self):
-        """Process data status update messages from storage units - adapted for partitions."""
-        logger.debug(f"[{self.controller_id}]: start receiving update_data_status requests...")
-
-        perf_monitor = IntervalPerfMonitor(caller_name=self.controller_id)
-
-        while True:
-            messages = self.data_status_update_socket.recv_multipart(copy=False)
-            identity = messages.pop(0)
-            serialized_msg = messages
-            request_msg = ZMQMessage.deserialize(serialized_msg)
-
-            if request_msg.request_type == ZMQRequestType.NOTIFY_DATA_UPDATE:
-                with perf_monitor.measure(op_type="NOTIFY_DATA_UPDATE"):
-                    message_data = request_msg.body
-                    partition_id = message_data.get("partition_id")
-
-                    # Update production status
-                    success = self.update_production_status(
-                        partition_id=partition_id,
-                        global_indexes=message_data.get("global_indexes", []),
-                        field_schema=message_data.get("field_schema", {}),
-                        custom_backend_meta=message_data.get("custom_backend_meta", {}),
-                        user_custom_meta=message_data.get("user_custom_meta", None),
-                    )
-
-                    if success:
-                        logger.debug(f"[{self.controller_id}]: Updated production status for partition {partition_id}")
-
-                    # Send acknowledgment
-                    response_msg = ZMQMessage.create(
-                        request_type=ZMQRequestType.NOTIFY_DATA_UPDATE_ACK,
-                        sender_id=self.controller_id,
-                        body={
-                            "controller_id": self.controller_id,
-                            "partition_id": partition_id,
-                            "success": success,
-                        },
-                    )
-                    self.data_status_update_socket.send_multipart([identity, *response_msg.serialize()])
 
     def get_zmq_server_info(self) -> ZMQServerInfo:
         """Get ZMQ server connection information."""

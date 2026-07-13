@@ -106,6 +106,13 @@ class StreamingTokenBudgetSampler(GRPOGroupNSampler):
         # window stops once mini_global_samples have been handed out across all
         # DPs, regardless of how unevenly the token-budget split them.
         self._dispatched: dict[tuple[str, str], dict[int, int]] = {}
+        # _dummy_rounds[(pid, tn)] -> set of (dp_rank, batch_index) that are
+        # "dummy rounds": at end-of-stream this dp's bucket was empty for this
+        # batch_index but some OTHER dp still got a real slice that round. The
+        # consumer emits a zero-grad dummy micro-batch for these so every dp runs
+        # the SAME number of micro-batches (required for MoE EP all-to-all, which
+        # matches collectives by call order across DP ranks).
+        self._dummy_rounds: dict[tuple[str, str], set[tuple[int, int]]] = {}
 
     def sample(
         self,
@@ -166,8 +173,13 @@ class StreamingTokenBudgetSampler(GRPOGroupNSampler):
         # PP-stage cache: when multiple PP stages request the same
         # (partition_id, task_name, dp_rank, batch_index), return the
         # cached result from the first call so all stages see identical data.
-        # At EOS, a DP cache miss may still need one more prepare to drain
-        # residue left by another DP rank's earlier prepare.
+        # A per-dp slice, once cached, is FROZEN — _prepare_batch_index below is
+        # idempotent per (dp, batch_index), so a later re-prepare (to serve a dp
+        # that had no data on the first round) never re-pops or overwrites a dp
+        # already served.  This is what keeps every PP stage of a dp on the same
+        # micro-batch; the previous code dropped the dp=0 guard on a cache miss,
+        # which evicted dp=0's real slice and let a re-prepare hand different PP
+        # stages different data.
         if batch_index is not None:
             cached = self._states.get(partition_id, {}).get(task_name, {}).get(dp_rank, {}).get(batch_index, None)
             if cached is not None:
@@ -179,9 +191,6 @@ class StreamingTokenBudgetSampler(GRPOGroupNSampler):
                     batch_index,
                 )
                 return cached
-            if production_done:
-                # Drop the batch-wide guard so prepare can fill this DP slot.
-                self._states.get(partition_id, {}).get(task_name, {}).get(0, {}).pop(batch_index, None)
 
         if partition is None:
             raise ValueError("StreamingTokenBudgetSampler requires partition kwarg from the controller")
@@ -250,11 +259,23 @@ class StreamingTokenBudgetSampler(GRPOGroupNSampler):
         every PP stage / dp request for this batch_index becomes a pure cache
         read with identical, pre-determined data.
 
-        Early-return when (dp_rank=0, batch_index) already cached: a real round
-        was prepared before; all dp entries were written together.
+        Early-return only when EVERY dp already has a cached slice for this
+        batch_index.  A per-dp slice, once cached, is frozen: re-prepares (to
+        serve a dp whose data arrived late) skip already-served dps, so all PP
+        stages of a dp read identical data.
         """
-        already = self._states.get(partition_id, {}).get(task_name, {}).get(0, {}).get(batch_index, None)
-        if already is not None:
+
+        def _dp_served(dp_i: int) -> bool:
+            # A (dp, batch_index) already holding a cached slice (real OR dummy)
+            # is FROZEN: never re-pop or overwrite it, so every PP stage of that
+            # dp reads identical data across re-prepares.
+            return self._states.get(partition_id, {}).get(task_name, {}).get(dp_i, {}).get(batch_index) is not None
+
+        # Skip work only when EVERY dp has already been served this batch_index.
+        # A partial round (some dp still empty, e.g. its data arrived later) must
+        # re-run to serve the stragglers — but idempotently, leaving the dps
+        # already frozen above untouched.
+        if all(_dp_served(dp_i) for dp_i in range(dp_size)):
             return
 
         key = (partition_id, task_name)
@@ -342,27 +363,43 @@ class StreamingTokenBudgetSampler(GRPOGroupNSampler):
         # left in the buckets stays there (still in ``assigned``) and carries
         # over to the NEXT window's batch_indexes — buckets are keyed by
         # (partition, task), not by window.  Streaming and uneven per-dp counts
-        # are preserved; only the global total per window is bounded.
+        # Per-window global cap: bound total dispatch to window_quota. Distribute
+        # the (final-round) remainder FAIRLY across the dps that have data this
+        # round — never skip later dps in loop order (that stranded dp2/dp3 and
+        # deadlocked). Residue beyond the quota stays in buckets for the next
+        # window (buckets are keyed by (partition, task), not by window).
         if window_quota is not None and window_id is not None:
             dispatched_so_far = self._dispatched.setdefault(key, {}).get(window_id, 0)
             remaining_quota: int | None = max(window_quota - dispatched_so_far, 0)
         else:
             remaining_quota = None
+
+        dps_with_data = [dp_i for dp_i in range(dp_size) if buckets.setdefault(dp_i, [])]
+        per_dp_cap: dict[int, int] | None = None
+        if remaining_quota is not None and dps_with_data:
+            base, extra = divmod(remaining_quota, len(dps_with_data))
+            per_dp_cap = {dp_i: base + (1 if idx < extra else 0) for idx, dp_i in enumerate(dps_with_data)}
+
         popped_this_call = 0
+        got_real = [False] * dp_size
         for dp_i in range(dp_size):
+            if _dp_served(dp_i):
+                continue  # idempotent: a dp already served this batch_index is frozen
             bucket = buckets.setdefault(dp_i, [])
-            if not bucket or (remaining_quota is not None and remaining_quota - popped_this_call <= 0):
-                if is_eos:
-                    self._cache_result(partition_id, task_name, dp_i, batch_index, ([], []))
+            if not bucket:
                 continue
             sel_count = self._select_up_to_budget(bucket, resolved_lengths, token_budget)
             sel_count = max(sel_count, 1)  # always make progress
-            if remaining_quota is not None:
-                sel_count = min(sel_count, remaining_quota - popped_this_call)
+            if per_dp_cap is not None:
+                cap = per_dp_cap.get(dp_i, 0)
+                if cap <= 0:
+                    continue  # quota exhausted for this dp this round; residue carries over
+                sel_count = min(sel_count, cap)
             result = self._pop_and_return(bucket, sel_count, assigned)
             if result[0]:
                 self._cache_result(partition_id, task_name, dp_i, batch_index, result)
                 popped_this_call += len(result[0])
+                got_real[dp_i] = True
 
         # Count only what was freshly popped this call (once per batch_index via
         # the ``already`` guard; the EOS re-prepare only pops new residue), so
@@ -370,6 +407,37 @@ class StreamingTokenBudgetSampler(GRPOGroupNSampler):
         if window_id is not None and popped_this_call:
             window_counts = self._dispatched.setdefault(key, {})
             window_counts[window_id] = window_counts.get(window_id, 0) + popped_this_call
+
+        # A window ends either because the producer is done (is_eos) OR because
+        # this window's global quota is now fully dispatched. In the fully-async
+        # case the producer runs ahead, so a window normally terminates by QUOTA
+        # while production_done is still False. The consumer's END test
+        # (is_window_drained) fires on quota alone, so the DUMMY padding below MUST
+        # fire under the same condition — otherwise a dp whose bucket emptied one
+        # round early ENDs unpadded and its micro-batch count falls short of a
+        # busier dp (MoE EP all-to-all mismatch → cross-DP deadlock).
+        window_now_drained = (
+            window_id is not None
+            and window_quota is not None
+            and self._dispatched.get(key, {}).get(window_id, 0) >= window_quota
+        )
+
+        # ── Per-round DUMMY marking (end-of-stream / quota-drained) ──────────
+        # This round produced a real slice for someone, but this dp's bucket was
+        # empty → mark it a DUMMY round for that dp. The consumer emits a dummy
+        # micro-batch and advances, so every dp ends at the SAME batch_index (the
+        # first all-empty round = END) with equal micro-batch counts. Cache an
+        # explicit empty so the dp=0 ``already`` guard keeps this batch_index from
+        # being recomputed. (Before EOS/quota an empty bucket means "wait", not dummy.)
+        if (is_eos or window_now_drained) and popped_this_call > 0:
+            dummy_set = self._dummy_rounds.setdefault(key, set())
+            for dp_i in range(dp_size):
+                # Only a dp with NO cached slice this batch_index (genuinely empty
+                # this round) becomes a dummy; never overwrite an already-served
+                # (real) slice with an empty one.
+                if not got_real[dp_i] and not _dp_served(dp_i):
+                    dummy_set.add((dp_i, batch_index))
+                    self._cache_result(partition_id, task_name, dp_i, batch_index, ([], []))
 
         logger.debug(
             "[stream-sampler] batch_idx=%s prepared: per-dp cached sizes=%s remaining_avail=%d eos=%s",
@@ -652,6 +720,22 @@ class StreamingTokenBudgetSampler(GRPOGroupNSampler):
             return True
         return bool(production_done and partition_drained)
 
+    def is_dummy_round(self, partition_id: str, task_name: str, dp_rank: int, batch_index: int) -> bool:
+        """True if (dp_rank, batch_index) is a DUMMY round: at end-of-stream this
+        dp's bucket was empty for this batch_index but another dp still got a real
+        slice that round. The consumer emits a zero-grad dummy micro-batch so all
+        dps run the same number of micro-batches. Distinguishes an empty fetch that
+        means 'pad a dummy' from one that means 'end of stream'."""
+        return (dp_rank, batch_index) in self._dummy_rounds.get((partition_id, task_name), set())
+
+    def window_dispatched(self, partition_id: str, task_name: str, window_id: int) -> int:
+        """Total samples dispatched (== consumed) across ALL dps for this window.
+
+        Lets the consumer log GLOBAL window progress (global_consumed / quota)
+        without a cross-DP all_reduce — the sampler already tracks this count
+        centrally for the per-window quota."""
+        return self._dispatched.get((partition_id, task_name), {}).get(window_id, 0)
+
     def clear_cache(self, partition_id: str):
         """Drop all per-DP buckets and assignment tracking for this partition."""
         super().clear_cache(partition_id)
@@ -667,6 +751,9 @@ class StreamingTokenBudgetSampler(GRPOGroupNSampler):
         for k in list(self._dispatched):
             if k[0] == partition_id:
                 del self._dispatched[k]
+        for k in list(self._dummy_rounds):
+            if k[0] == partition_id:
+                del self._dummy_rounds[k]
         # Also clear the parent GRPO sampler's internal cache used by
         # _run_balance_round (keyed under "__streaming_internal__").
         if "__streaming_internal__" in self._states:

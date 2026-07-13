@@ -248,6 +248,7 @@ class StorageManager(ABC):
                 "global_indexes": global_indexes,
                 "field_schema": normalized_field_schema,
                 "custom_backend_meta": custom_backend_meta,
+                "user_custom_meta": user_custom_meta,
             },
         ).serialize()
 
@@ -267,46 +268,6 @@ class StorageManager(ABC):
         sock.connect(self.controller_info.to_addr("request_handle_socket"))
 
         try:
-            sock.connect(self.controller_info.to_addr("data_status_update_socket"))
-
-            normalized_field_schema = {}
-            for field_name, field in field_schema.items():
-                # Work on a shallow copy to avoid mutating caller-provided schema
-                field_copy = field.copy()
-                per_sample_shapes = field_copy.get("per_sample_shapes", None)
-                if isinstance(per_sample_shapes, list | tuple):
-                    if len(per_sample_shapes) != len(global_indexes):
-                        raise ValueError(
-                            f"per_sample_shapes length ({len(per_sample_shapes)}) does not match "
-                            f"number of global_indexes ({len(global_indexes)}) for field '{field_name}'; "
-                            f"skipping per_sample_shapes normalization."
-                        )
-                    else:
-                        field_copy["per_sample_shapes"] = {
-                            global_indexes[i]: per_sample_shapes[i] for i in range(len(global_indexes))
-                        }
-
-                normalized_field_schema[field_name] = field_copy
-
-            # convert per_sample_shapes into dict
-            for field in field_schema.values():
-                per_sample_shapes = field.get("per_sample_shapes", None)
-                if per_sample_shapes:
-                    per_sample_shapes = {global_indexes[i]: per_sample_shapes[i] for i in range(len(global_indexes))}
-                    field["per_sample_shapes"] = per_sample_shapes
-
-            request_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.NOTIFY_DATA_UPDATE,  # type: ignore[arg-type]
-                sender_id=self.storage_manager_id,
-                body={
-                    "partition_id": partition_id,
-                    "global_indexes": global_indexes,
-                    "field_schema": normalized_field_schema,
-                    "custom_backend_meta": custom_backend_meta,
-                    "user_custom_meta": user_custom_meta,
-                },
-            ).serialize()
-
             await sock.send_multipart(request_msg)
             logger.debug(
                 f"[{self.storage_manager_id}]: Sent data status update request "
