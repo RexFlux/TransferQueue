@@ -173,6 +173,7 @@ def test_simple_storage_uses_hard_affinity_when_configured(monkeypatch, caplog):
     assert all(strategy.soft is False for strategy in strategies)
     affinity_logs = [record for record in caplog.records if "Applying node affinity:" in record.getMessage()]
     assert len(affinity_logs) == 2
+    assert "has been created on node" not in caplog.text
     for rank, record in enumerate(affinity_logs):
         assert record.levelno == logging.INFO
         assert record.getMessage() == (

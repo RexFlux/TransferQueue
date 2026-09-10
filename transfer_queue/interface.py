@@ -183,10 +183,8 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
     }
     required_node_resource = final_conf.controller.get("required_node_resource", None)
     if required_node_resource is not None:
-        controller_options["scheduling_strategy"] = get_node_round_robin_scheduling_strategies(
-            1, required_node_resource=required_node_resource
-        )[0]
-        strategy = controller_options["scheduling_strategy"]
+        strategy = get_node_round_robin_scheduling_strategies(1, required_node_resource=required_node_resource)[0]
+        controller_options["scheduling_strategy"] = strategy
         logger.info(
             f"Applying node affinity: actor={controller_options['name']} "
             f"required_node_resource={required_node_resource} node_id={strategy.node_id} "

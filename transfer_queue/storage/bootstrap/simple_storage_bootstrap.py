@@ -57,8 +57,8 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
                 placement_group_bundle_index=storage_unit_rank,
             )
         else:
-            actor_options["scheduling_strategy"] = scheduling_strategies[storage_unit_rank]
             strategy = scheduling_strategies[storage_unit_rank]
+            actor_options["scheduling_strategy"] = strategy
             logger.info(
                 f"Applying node affinity: actor={actor_options['name']} "
                 f"required_node_resource={required_node_resource} node_id={strategy.node_id} "
@@ -69,13 +69,7 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
             storage_unit_size=storage_unit_size,
         )
         simple_storage_handles[f"TransferQueueStorageUnit#{storage_unit_rank}"] = storage_node
-        if scheduling_strategies is None:
-            logger.info(f"TransferQueueStorageUnit#{storage_unit_rank} has been created.")
-        else:
-            logger.info(
-                f"TransferQueueStorageUnit#{storage_unit_rank} has been created "
-                f"on node {scheduling_strategies[storage_unit_rank].node_id}."
-            )
+        logger.info(f"TransferQueueStorageUnit#{storage_unit_rank} has been created.")
 
     storage_zmq_info = process_zmq_server_info(simple_storage_handles)
     backend_name = conf.backend.storage_backend
