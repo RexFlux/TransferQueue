@@ -20,7 +20,7 @@ from collections import defaultdict
 from collections.abc import Mapping
 from operator import itemgetter
 from pathlib import Path
-from typing import Any, Callable, NamedTuple, Optional
+from typing import Any, Callable, NamedTuple
 
 import torch
 import zmq
@@ -282,7 +282,7 @@ class AsyncSimpleStorageManager(StorageManager):
         # atomically with the readiness notification (avoids the put/set_custom_meta
         # race for streaming consumers). Only sent when at least one sample has it.
         user_custom_meta_list = metadata.get_all_custom_meta()
-        user_custom_meta: Optional[dict[int, dict[str, Any]]] = None
+        user_custom_meta: dict[int, dict[str, Any]] | None = None
         if any(user_custom_meta_list):
             user_custom_meta = {
                 metadata.global_indexes[i]: user_custom_meta_list[i]

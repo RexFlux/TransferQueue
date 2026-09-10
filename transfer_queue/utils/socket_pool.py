@@ -52,7 +52,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable
 
 import zmq
 import zmq.asyncio
@@ -124,7 +124,7 @@ class SocketPool:
         ip: str,
         identity_prefix: str,
         max_size: int = TQ_POOL_SIZE,
-        on_create: Optional[Callable[[zmq.asyncio.Socket], None]] = None,
+        on_create: Callable[[zmq.asyncio.Socket], None] | None = None,
     ):
         self._context = context
         self._address = address
@@ -227,7 +227,7 @@ class SocketPoolManager:
         address: str,
         ip: str,
         identity_prefix: str,
-        on_create: Optional[Callable[[zmq.asyncio.Socket], None]] = None,
+        on_create: Callable[[zmq.asyncio.Socket], None] | None = None,
     ) -> SocketPool:
         """Look up or create the pool for ``(current_loop, *pool_key)``.
 
@@ -302,7 +302,7 @@ async def invoke_with_pool(
         ``asyncio.CancelledError`` immediately if the call is cancelled
         (cancellation is not retried).
     """
-    last_exc: Optional[BaseException] = None
+    last_exc: BaseException | None = None
     for attempt in range(1, max_attempts + 1):
         ps = await pool.acquire()
         clean_exit = False
