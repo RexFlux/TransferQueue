@@ -58,6 +58,12 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
             )
         else:
             actor_options["scheduling_strategy"] = scheduling_strategies[storage_unit_rank]
+            strategy = scheduling_strategies[storage_unit_rank]
+            logger.info(
+                f"Applying node affinity: actor={actor_options['name']} "
+                f"required_node_resource={required_node_resource} node_id={strategy.node_id} "
+                f"soft={str(strategy.soft).lower()}"
+            )
 
         storage_node = SimpleStorageUnit.options(**actor_options).remote(  # type: ignore[attr-defined]
             storage_unit_size=storage_unit_size,

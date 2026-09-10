@@ -211,6 +211,13 @@ initialization fails immediately if no alive node provides the requested
 resource. Leaving either option unset or `null` preserves its existing Ray
 scheduling behavior. The resource names are user-defined Ray resource labels;
 TransferQueue does not reserve or consume their capacity.
+
+Set `TQ_LOGGING_LEVEL=INFO` before starting the process that initializes
+TransferQueue to log each configured actor's affinity selection. The
+`Applying node affinity:` message includes the actor name,
+`required_node_resource`, selected `node_id`, and `soft=false`. This records
+the scheduling strategy being submitted, not confirmation that the actor is
+running on that node; verify the actor's actual placement through Ray state.
    
 ### Build wheel package from source code
 

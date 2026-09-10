@@ -186,6 +186,12 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
         controller_options["scheduling_strategy"] = get_node_round_robin_scheduling_strategies(
             1, required_node_resource=required_node_resource
         )[0]
+        strategy = controller_options["scheduling_strategy"]
+        logger.info(
+            f"Applying node affinity: actor={controller_options['name']} "
+            f"required_node_resource={required_node_resource} node_id={strategy.node_id} "
+            f"soft={str(strategy.soft).lower()}"
+        )
 
     try:
         global _TQ_CONTROLLER

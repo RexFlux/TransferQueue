@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from unittest.mock import MagicMock, call
 
 import pytest
@@ -121,7 +122,8 @@ def test_affinity_fails_fast_when_no_alive_node_matches(monkeypatch):
 
 
 @pytest.mark.parametrize("required_node_resource", [_UNSET, None], ids=["missing", "null"])
-def test_unconfigured_simple_storage_preserves_placement_group(monkeypatch, required_node_resource):
+def test_unconfigured_simple_storage_preserves_placement_group(monkeypatch, caplog, required_node_resource):
+    caplog.set_level(logging.INFO, logger=simple_storage_bootstrap.logger.name)
     storage_unit = _mock_storage_initialization(monkeypatch)
     placement_group = MagicMock()
     get_placement_group = MagicMock(return_value=placement_group)
@@ -137,6 +139,7 @@ def test_unconfigured_simple_storage_preserves_placement_group(monkeypatch, requ
 
     get_placement_group.assert_called_once_with(2, num_cpus_per_actor=1)
     get_strategies.assert_not_called()
+    assert "Applying node affinity:" not in caplog.text
     assert storage_unit.options.call_args_list == [
         call(
             name="TransferQueueStorageUnit#0",
@@ -151,7 +154,8 @@ def test_unconfigured_simple_storage_preserves_placement_group(monkeypatch, requ
     ]
 
 
-def test_simple_storage_uses_hard_affinity_when_configured(monkeypatch):
+def test_simple_storage_uses_hard_affinity_when_configured(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=simple_storage_bootstrap.logger.name)
     storage_unit = _mock_storage_initialization(monkeypatch)
     get_placement_group = MagicMock()
     monkeypatch.setattr(simple_storage_bootstrap, "get_placement_group", get_placement_group)
@@ -167,6 +171,14 @@ def test_simple_storage_uses_hard_affinity_when_configured(monkeypatch):
     strategies = [options.kwargs["scheduling_strategy"] for options in storage_unit.options.call_args_list]
     assert [strategy.node_id for strategy in strategies] == [_NODE_A, _NODE_A]
     assert all(strategy.soft is False for strategy in strategies)
+    affinity_logs = [record for record in caplog.records if "Applying node affinity:" in record.getMessage()]
+    assert len(affinity_logs) == 2
+    for rank, record in enumerate(affinity_logs):
+        assert record.levelno == logging.INFO
+        assert record.getMessage() == (
+            f"Applying node affinity: actor=TransferQueueStorageUnit#{rank} "
+            f"required_node_resource=storage_pool node_id={_NODE_A} soft=false"
+        )
 
 
 def test_simple_storage_fails_before_actor_creation_when_no_node_matches(monkeypatch):
@@ -180,7 +192,8 @@ def test_simple_storage_fails_before_actor_creation_when_no_node_matches(monkeyp
 
 
 @pytest.mark.parametrize("controller_conf", [None, {"required_node_resource": None}])
-def test_unconfigured_controller_preserves_default_ray_scheduling(monkeypatch, controller_conf):
+def test_unconfigured_controller_preserves_default_ray_scheduling(monkeypatch, caplog, controller_conf):
+    caplog.set_level(logging.INFO, logger=interface.logger.name)
     controller = _mock_controller_initialization(monkeypatch)
     conf = None if controller_conf is None else OmegaConf.create({"controller": controller_conf})
 
@@ -190,9 +203,11 @@ def test_unconfigured_controller_preserves_default_ray_scheduling(monkeypatch, c
         name="TransferQueueController",
         namespace="transfer_queue",
     )
+    assert "Applying node affinity:" not in caplog.text
 
 
-def test_controller_uses_hard_affinity_when_configured(monkeypatch):
+def test_controller_uses_hard_affinity_when_configured(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=interface.logger.name)
     controller = _mock_controller_initialization(monkeypatch)
     monkeypatch.setattr(
         common.ray,
@@ -207,6 +222,13 @@ def test_controller_uses_hard_affinity_when_configured(monkeypatch):
     assert options["namespace"] == "transfer_queue"
     assert options["scheduling_strategy"].node_id == _NODE_A
     assert options["scheduling_strategy"].soft is False
+    affinity_logs = [record for record in caplog.records if "Applying node affinity:" in record.getMessage()]
+    assert len(affinity_logs) == 1
+    assert affinity_logs[0].levelno == logging.INFO
+    assert affinity_logs[0].getMessage() == (
+        f"Applying node affinity: actor=TransferQueueController "
+        f"required_node_resource=control_pool node_id={_NODE_A} soft=false"
+    )
 
 
 def test_controller_fails_before_actor_creation_when_no_node_matches(monkeypatch):
