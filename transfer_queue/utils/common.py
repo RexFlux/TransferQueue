@@ -19,6 +19,7 @@ from contextlib import contextmanager
 import psutil
 import ray
 import torch
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from transfer_queue.utils.logging_utils import get_logger
 
@@ -42,6 +43,43 @@ def get_placement_group(num_ray_actors: int, num_cpus_per_actor: int = 1):
     placement_group = ray.util.placement_group([bundle for _ in range(num_ray_actors)], strategy="SPREAD")
     ray.get(placement_group.ready())
     return placement_group
+
+
+def get_node_round_robin_scheduling_strategies(
+    num_actors: int, required_node_resource: str
+) -> list[NodeAffinitySchedulingStrategy]:
+    """Create hard-affinity strategies across nodes providing a resource.
+
+    Eligible nodes must be alive and advertise a positive capacity for
+    ``required_node_resource``. Actors are assigned to eligible nodes in
+    deterministic round-robin order.
+
+    Args:
+        num_actors: Number of Ray actors to schedule.
+        required_node_resource: Ray custom resource required on eligible nodes.
+
+    Returns:
+        One hard node-affinity scheduling strategy per actor.
+
+    Raises:
+        ValueError: If no alive Ray node provides the required resource.
+    """
+    eligible_node_ids = sorted(
+        node["NodeID"]
+        for node in ray.nodes()
+        if node.get("Alive", False) and node.get("Resources", {}).get(required_node_resource, 0) > 0
+    )
+    if not eligible_node_ids:
+        raise ValueError(
+            f"No alive Ray nodes provide custom resource {required_node_resource!r}. "
+            "Start an eligible node with a positive resource capacity or unset "
+            "the corresponding required_node_resource option."
+        )
+
+    return [
+        NodeAffinitySchedulingStrategy(node_id=eligible_node_ids[i % len(eligible_node_ids)], soft=False)
+        for i in range(num_actors)
+    ]
 
 
 @contextmanager

@@ -35,6 +35,7 @@ from transfer_queue.sampler import *  # noqa: F401
 from transfer_queue.sampler import BaseSampler
 from transfer_queue.storage.bootstrap import StorageBootstrapProvider
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
+from transfer_queue.utils.common import get_node_round_robin_scheduling_strategies
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.yuanrong_utils import cleanup_yuanrong_resources
 from transfer_queue.utils.zmq_utils import process_zmq_server_info
@@ -176,11 +177,21 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
     except KeyError:
         raise ValueError(f"Could not find sampler {final_conf.controller.sampler}") from None
 
+    controller_options: dict[str, Any] = {
+        "name": "TransferQueueController",
+        "namespace": "transfer_queue",
+    }
+    required_node_resource = final_conf.controller.get("required_node_resource", None)
+    if required_node_resource is not None:
+        controller_options["scheduling_strategy"] = get_node_round_robin_scheduling_strategies(
+            1, required_node_resource=required_node_resource
+        )[0]
+
     try:
         global _TQ_CONTROLLER
-        _TQ_CONTROLLER = TransferQueueController.options(  # type: ignore[attr-defined]
-            name="TransferQueueController", namespace="transfer_queue"
-        ).remote(sampler=sampler, polling_mode=final_conf.controller.polling_mode)
+        _TQ_CONTROLLER = TransferQueueController.options(**controller_options).remote(  # type: ignore[attr-defined]
+            sampler=sampler, polling_mode=final_conf.controller.polling_mode
+        )
         logger.info("TransferQueueController has been created.")
     except ValueError:
         logger.info("Some other rank has initialized TransferQueueController. Try to connect to existing controller.")

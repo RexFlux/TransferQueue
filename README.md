@@ -191,6 +191,26 @@ pip install TransferQueue
    ```bash
    pip install .
    ```
+
+### Pin TransferQueue actors to Ray custom-resource nodes
+
+TransferQueue can optionally hard-pin the controller and its built-in
+`SimpleStorageUnit` actors to alive Ray nodes that advertise a positive custom
+resource. Configure either actor type independently:
+
+```yaml
+controller:
+  required_node_resource: control_pool
+backend:
+  SimpleStorage:
+    required_node_resource: storage_pool
+```
+
+When configured, actor placement uses hard node affinity (`soft=False`) and
+initialization fails immediately if no alive node provides the requested
+resource. Leaving either option unset or `null` preserves its existing Ray
+scheduling behavior. The resource names are user-defined Ray resource labels;
+TransferQueue does not reserve or consume their capacity.
    
 ### Build wheel package from source code
 
