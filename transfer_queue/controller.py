@@ -2460,6 +2460,10 @@ class TransferQueueController:
         """Get ZMQ server connection information."""
         return self.zmq_server_info
 
+    def get_node_id(self) -> str:
+        """Return the Ray node holding this controller's CPU allocation."""
+        return ray.get_runtime_context().get_node_id()
+
     def store_config(self, conf: DictConfig) -> None:
         """Store the global config of TransferQueue."""
         self.tq_config = conf

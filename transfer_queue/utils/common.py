@@ -46,40 +46,64 @@ def get_placement_group(num_ray_actors: int, num_cpus_per_actor: int = 1):
 
 
 def get_node_round_robin_scheduling_strategies(
-    num_actors: int, required_node_resource: str
+    num_actors: int,
+    required_node_resource: str,
+    *,
+    reserved_cpus: dict[str, float] | None = None,
 ) -> list[NodeAffinitySchedulingStrategy]:
     """Create hard-affinity strategies across nodes providing a resource.
 
     Eligible nodes must be alive and advertise a positive capacity for
     ``required_node_resource``. Actors are assigned to eligible nodes in
-    deterministic round-robin order.
+    deterministic round-robin order, skipping nodes whose CPU slots are full.
+    Each actor requires one CPU, as declared by Controller and SimpleStorage.
+    This is a total-capacity check, not a reservation of currently free CPUs.
 
     Args:
         num_actors: Number of Ray actors to schedule.
         required_node_resource: Ray custom resource required on eligible nodes.
+        reserved_cpus: CPUs already assigned to persistent actors, keyed by node ID.
 
     Returns:
         One hard node-affinity scheduling strategy per actor.
 
     Raises:
-        ValueError: If no alive Ray node provides the required resource.
+        ValueError: If no eligible nodes exist or CPU capacity is insufficient.
     """
-    eligible_node_ids = sorted(
-        node["NodeID"]
-        for node in ray.nodes()
-        if node.get("Alive", False) and node.get("Resources", {}).get(required_node_resource, 0) > 0
+    eligible_nodes = sorted(
+        (
+            node
+            for node in ray.nodes()
+            if node.get("Alive", False) and node.get("Resources", {}).get(required_node_resource, 0) > 0
+        ),
+        key=lambda node: node["NodeID"],
     )
-    if not eligible_node_ids:
+    if not eligible_nodes:
         raise ValueError(
             f"No alive Ray nodes provide custom resource {required_node_resource!r}. "
             "Start an eligible node with a positive resource capacity or unset "
             "the corresponding required_node_resource option."
         )
 
-    return [
-        NodeAffinitySchedulingStrategy(node_id=eligible_node_ids[i % len(eligible_node_ids)], soft=False)
-        for i in range(num_actors)
-    ]
+    reservations = reserved_cpus or {}
+    cpu_slots = {
+        node["NodeID"]: max(0, int(node.get("Resources", {}).get("CPU", 0) - reservations.get(node["NodeID"], 0)))
+        for node in eligible_nodes
+    }
+    if sum(cpu_slots.values()) < num_actors:
+        raise ValueError(
+            f"Insufficient CPU capacity for {num_actors} actors requiring resource {required_node_resource!r}: "
+            f"{sum(cpu_slots.values())} one-CPU slots remain after accounting for existing actors."
+        )
+    strategies: list[NodeAffinitySchedulingStrategy] = []
+    while len(strategies) < num_actors:
+        for node_id, slots in cpu_slots.items():
+            if slots > 0:
+                strategies.append(NodeAffinitySchedulingStrategy(node_id=node_id, soft=False))
+                cpu_slots[node_id] -= 1
+                if len(strategies) == num_actors:
+                    break
+    return strategies
 
 
 @contextmanager

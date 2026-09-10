@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import time
+from contextlib import ExitStack
 from importlib import resources
 from pathlib import Path
 from typing import Any, Callable
@@ -25,6 +26,7 @@ from typing import Any, Callable
 import ray
 import torch
 from omegaconf import DictConfig, OmegaConf
+from ray.exceptions import ActorUnschedulableError, RayActorError
 from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorStack
 
@@ -69,7 +71,9 @@ def _maybe_create_tq_client(conf: DictConfig | None = None) -> TransferQueueClie
     return _TQ_CLIENT
 
 
-def _maybe_create_tq_storage(conf: DictConfig) -> DictConfig:
+def _maybe_create_tq_storage(
+    conf: DictConfig, reserved_cpus: dict[str, float] | None = None, rollback: ExitStack | None = None
+) -> DictConfig:
     global _TQ_STORAGE
 
     if _TQ_STORAGE is None:
@@ -77,7 +81,10 @@ def _maybe_create_tq_storage(conf: DictConfig) -> DictConfig:
         backend_name = conf.backend.storage_backend
         provider_fn = StorageBootstrapProvider.get_provider(backend_name)
         if provider_fn is not None:
-            backend_resources = provider_fn(conf)
+            if backend_name == "SimpleStorage" and rollback is not None:
+                backend_resources = provider_fn(conf, reserved_cpus=reserved_cpus, rollback=rollback)
+            else:
+                backend_resources = provider_fn(conf)
             if backend_resources is not None:
                 _TQ_STORAGE[backend_name] = backend_resources
             else:
@@ -108,7 +115,13 @@ def _init_from_existing() -> bool:
 
     conf = None
     while conf is None:
-        conf = ray.get(_TQ_CONTROLLER.get_config.remote())
+        try:
+            conf = ray.get(_TQ_CONTROLLER.get_config.remote())
+        except (ActorUnschedulableError, RayActorError):
+            # An initializer may have rolled back this unpublished controller.
+            # Fail this call, but let an explicit retry discover a replacement.
+            _TQ_CONTROLLER = None
+            raise
         if conf is not None:
             _maybe_create_tq_client(conf)
 
@@ -150,6 +163,7 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
         >>> metadata = tq.get_meta(...)
         >>> data = tq.get_data(metadata)
     """
+    global _TQ_CONTROLLER, _TQ_STORAGE
     if _init_from_existing():
         return conf
 
@@ -177,6 +191,18 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
     except KeyError:
         raise ValueError(f"Could not find sampler {final_conf.controller.sampler}") from None
 
+    # Reject invalid storage affinity before publishing a named controller whose
+    # config other ranks would wait for. Bootstrap rechecks the current layout
+    # after the controller starts, accounting for its actual CPU placement.
+    storage_resource = None
+    if final_conf.backend.storage_backend == "SimpleStorage":
+        storage_conf = final_conf.backend.SimpleStorage
+        storage_resource = storage_conf.get("required_node_resource", None)
+        if storage_resource is not None:
+            get_node_round_robin_scheduling_strategies(
+                storage_conf.num_data_storage_units, required_node_resource=storage_resource
+            )
+
     controller_options: dict[str, Any] = {
         "name": "TransferQueueController",
         "namespace": "transfer_queue",
@@ -192,7 +218,6 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
         )
 
     try:
-        global _TQ_CONTROLLER
         _TQ_CONTROLLER = TransferQueueController.options(**controller_options).remote(  # type: ignore[attr-defined]
             sampler=sampler, polling_mode=final_conf.controller.polling_mode
         )
@@ -202,12 +227,31 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
         _init_from_existing()
         return final_conf
 
-    controller_zmq_info = process_zmq_server_info(_TQ_CONTROLLER)
-    final_conf.controller.zmq_info = controller_zmq_info
+    affinity_enabled = required_node_resource is not None or storage_resource is not None
+    previous_storage = _TQ_STORAGE
+    # Register only objects created by this attempt. Reuse/racing-creator paths
+    # returned above; callbacks are discarded once the config is published.
+    with ExitStack() as rollback:
+        if affinity_enabled:
+            rollback.callback(ray.kill, _TQ_CONTROLLER, no_restart=True)
+        try:
+            final_conf.controller.zmq_info = process_zmq_server_info(_TQ_CONTROLLER)
+            if affinity_enabled:
+                reserved_cpus = None
+                if storage_resource is not None:
+                    controller_node_id = ray.get(_TQ_CONTROLLER.get_node_id.remote())
+                    reserved_cpus = {controller_node_id: 1.0}
+                final_conf = _maybe_create_tq_storage(final_conf, reserved_cpus=reserved_cpus, rollback=rollback)
+            else:
+                final_conf = _maybe_create_tq_storage(final_conf)
+            ray.get(_TQ_CONTROLLER.store_config.remote(final_conf))
+        except Exception:
+            if affinity_enabled:
+                _TQ_CONTROLLER = None
+                _TQ_STORAGE = previous_storage
+            raise
+        rollback.pop_all()
 
-    final_conf = _maybe_create_tq_storage(final_conf)
-
-    ray.get(_TQ_CONTROLLER.store_config.remote(final_conf))
     logger.info(f"TransferQueue config: {final_conf}")
 
     # start Prometheus metrics exporter if enabled
